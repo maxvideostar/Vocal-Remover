@@ -12,7 +12,7 @@ BASE="/opt/vocal-remover"
 PORT=8095
 
 echo "==> Pachete sistem..."
-apt-get update -qq
+apt-get update -qq || echo "   ⚠ Unele repo-uri apt au erori (ignorat, continui)..."
 apt-get install -y -qq python3-venv python3-pip ffmpeg >/dev/null
 
 echo "==> Mediu Python..."
