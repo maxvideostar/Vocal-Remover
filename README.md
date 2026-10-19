@@ -1,6 +1,6 @@
-# 🎤 Vocal Remover
+# 🎤 Vocal Remover + YouTube Downloader
 
-Separare **voce / instrumental** cu AI ([Demucs](https://github.com/facebookresearch/demucs) de la Meta), cu interfață web simplă, pentru servere Ubuntu.
+Separare **voce / instrumental** cu AI ([Demucs](https://github.com/facebookresearch/demucs) de la Meta) și **descărcare YouTube** (video MP4 / MP3, prin [yt-dlp](https://github.com/yt-dlp/yt-dlp)), cu interfață web simplă, pentru servere Ubuntu.
 
 Încarci o melodie (sau un videoclip), iar aplicația îți dă două piste separate: **Voce** și **Instrumental** (karaoke).
 
@@ -17,6 +17,15 @@ Separare **voce / instrumental** cu AI ([Demucs](https://github.com/facebookrese
 - ⏳ Coadă de procesare, păstrată și după restart
 - 🔁 Serviciu systemd, pornește automat la boot
 - 📱 Interfață responsive (merge și pe telefon)
+
+### ▶️ YouTube
+- Lipești unul sau mai multe link-uri (unul pe linie)
+- **MP3 320k** cu copertă și metadate, sau **video MP4** la calitate maximă (până la 4K), 1080p, 720p sau 480p
+- Opțiunea **„+ separă vocea”**: după descărcarea MP3-ului, melodia intră automat la separare
+- yt-dlp se actualizează zilnic automat (cron)
+
+### 🌍 Acces extern (opțional)
+Scriptul poate configura nginx pe domeniul tău la `/vocal/`, protejat cu utilizator și parolă. Detectează automat server block-ul existent pentru domeniu și face backup înainte de modificare.
 
 ## 🖥️ Cerințe
 
@@ -64,23 +73,34 @@ Fișierele aplicației se află în `/opt/vocal-remover/`:
 ├── venv/         # mediu Python
 ├── uploads/      # fișiere în curs de procesare
 ├── output/       # rezultate (voce + instrumental)
+├── youtube/      # descărcări YouTube
 └── jobs.json     # istoric / coadă
 ```
 
 Pentru alt port, modifică `PORT=` în script înainte de instalare.
+
+Instalare neinteractivă, cu nginx:
+
+```bash
+sudo DOMAIN=exemplu.ro SETUP_NGINX=yes VR_USER=admin VR_PASS='parola' bash vocal-remover-install.sh
+```
+
+Scriptul poate fi rulat din nou oricând pentru update; istoricul se păstrează.
 
 ## 🗑️ Dezinstalare
 
 ```bash
 sudo systemctl disable --now vocal-remover
 sudo rm /etc/systemd/system/vocal-remover.service
-sudo rm -rf /opt/vocal-remover
+sudo rm -rf /opt/vocal-remover /etc/cron.daily/vocal-remover-ytdlp
 sudo systemctl daemon-reload
 ```
 
 ## ⚠️ Securitate
 
 Aplicația nu are autentificare. Folosește-o în rețeaua locală sau pune-o în spatele unui reverse proxy (nginx) cu parolă și HTTPS dacă o expui pe internet.
+
+Descarcă doar conținut pe care ai dreptul să-l folosești.
 
 ## 📜 Licență
 
