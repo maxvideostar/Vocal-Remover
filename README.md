@@ -18,6 +18,13 @@ Separare **voce / instrumental** cu AI ([Demucs](https://github.com/facebookrese
 - 🔁 Serviciu systemd, pornește automat la boot
 - 📱 Interfață responsive (merge și pe telefon)
 
+### 🎼 Tonalitate și tempo
+- Detectează automat **tonalitatea** (ex. `Am · La minor`) și **BPM-ul** fiecărei melodii
+- **Transpunere** ±12 semitonuri și **schimbare tempo** 50–150%, independent, fără să afecteze calitatea (Rubber Band)
+- Arată live noua tonalitate și noul BPM înainte de aplicare
+- Se aplică pe Instrumental, Voce sau ambele (pentru voce se păstrează timbrul natural)
+- Mod **„Doar tonalitate/tempo”** pentru melodii pe care vrei doar să le transpui, fără separare
+
 ### ▶️ YouTube
 - Lipești unul sau mai multe link-uri (unul pe linie)
 - **MP3 320k** cu copertă și metadate, sau **video MP4** la calitate maximă (până la 4K), 1080p, 720p sau 480p

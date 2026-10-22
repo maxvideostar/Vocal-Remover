@@ -59,8 +59,30 @@ mkdir -p "$BASE"/{uploads,output,youtube}
 "$BASE/venv/bin/pip" install -q --upgrade pip wheel
 # torch CPU (fixat pe 2.5.1 – compatibil sigur cu demucs)
 "$BASE/venv/bin/pip" install -q torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
-"$BASE/venv/bin/pip" install -q demucs==4.0.1 flask waitress soundfile
+"$BASE/venv/bin/pip" install -q demucs==4.0.1 flask waitress soundfile "librosa>=0.10.2"
 "$BASE/venv/bin/pip" install -q -U "yt-dlp[default]"
+
+echo "==> Modul analiză tonalitate / tempo..."
+cat > "$BASE/analyze.py" <<'PYEOF'
+# Detectează BPM și tonalitatea unui fișier WAV (mono). Afișează JSON.
+import sys, json, warnings
+warnings.filterwarnings("ignore")
+import numpy as np, librosa
+y, sr = librosa.load(sys.argv[1], sr=22050, mono=True)
+yh, yp = librosa.effects.hpss(y)
+tempo, _ = librosa.beat.beat_track(y=yp, sr=sr)
+bpm = float(np.atleast_1d(tempo)[0])
+chroma = librosa.feature.chroma_cqt(y=yh, sr=sr).mean(axis=1)
+# profile Krumhansl-Schmuckler
+MAJ = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+MIN = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+best = (-2.0, 0, "major")
+for i in range(12):
+    for prof, mode in ((MAJ, "major"), (MIN, "minor")):
+        c = float(np.corrcoef(chroma, np.roll(prof, i))[0, 1])
+        if c > best[0]: best = (c, i, mode)
+print(json.dumps({"bpm": round(bpm, 1), "key": best[1], "kmode": best[2], "conf": round(best[0], 2)}))
+PYEOF
 
 echo "==> Aplicație web..."
 cat > "$BASE/app.py" <<'PYEOF'
@@ -83,9 +105,16 @@ FMTS = {"mp3": ["--mp3", "--mp3-bitrate", "320"], "wav": [], "flac": ["--flac"]}
 YT_FMTS = {"mp3": "🎵 MP3 320k", "best": "🎬 Video – calitate maximă (până la 4K)",
            "1080": "🎬 Video MP4 1080p", "720": "🎬 Video MP4 720p", "480": "🎬 Video MP4 480p"}
 JUNK = (".part", ".ytdl", ".webp", ".jpg", ".jpeg", ".png", ".temp")
+ENC = {"mp3": ["-c:a", "libmp3lame", "-b:a", "320k"], "wav": ["-c:a", "pcm_s16le"], "flac": ["-c:a", "flac"]}
+TRACK_LABEL = {"vocals": "Voce", "instrumental": "Instrumental", "original": "Original"}
+try:
+    HAS_RB = "rubberband" in subprocess.run(["ffmpeg", "-hide_banner", "-filters"],
+                                            capture_output=True, text=True).stdout
+except Exception:
+    HAS_RB = False
 
 lock = threading.RLock()
-sq, yq = queue.Queue(), queue.Queue()
+sq, yq, fxq = queue.Queue(), queue.Queue(), queue.Queue()
 jobs = {}
 
 def save():
@@ -107,14 +136,23 @@ def load():
         except Exception: jobs = {}
     for jid, j in sorted(jobs.items(), key=lambda x: x[1].get("created", 0)):
         j.setdefault("type", "sep")
+        if j["type"] == "sep": j.setdefault("mode", "sep")
         if j["status"] in ("queued", "processing"):
             j["progress"] = 0
             if j["type"] == "yt":
                 j["status"] = "queued"; yq.put(jid)
             elif os.path.exists(j.get("path", "")):
-                j["status"] = "queued"; sq.put(jid)
+                j["status"] = "queued"
+                if j["mode"] == "ana": fxq.put(("conv", jid))
+                else: sq.put(jid)
             else:
                 j["status"], j["error"] = "error", "Întrerupt la restart"
+        if j["type"] == "sep" and j["status"] == "done":
+            if j.get("ana") in (None, "queued", "processing"):
+                j["ana"] = "queued"; fxq.put(("ana", jid))
+            for s in j.get("shifts", []):
+                if s["status"] in ("queued", "processing"):
+                    s["status"] = "queued"; fxq.put(("shift", jid, s["id"]))
 
 def run(cmd, j, pattern):
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -147,7 +185,8 @@ def sep_worker():
             shutil.move(v[0], f"{od}/vocals.{ext}")
             shutil.move(n[0], f"{od}/instrumental.{ext}")
             for d in glob.glob(f"{od}/*/"): shutil.rmtree(d, ignore_errors=True)
-            j.update(status="done", progress=100, ext=ext, finished=time.time())
+            j.update(status="done", progress=100, ext=ext, finished=time.time(), ana="queued")
+            fxq.put(("ana", jid))
         except Exception as e:
             j.update(status="error", error=str(e)[-400:])
         finally:
@@ -196,6 +235,90 @@ def yt_worker():
         finally:
             save()
 
+# ---------- tonalitate / tempo ----------
+def ff(args, timeout=3600):
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args],
+                       capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0: raise RuntimeError(r.stderr[-400:] or "ffmpeg a eșuat")
+
+def track_file(j, track):
+    return f"{OUT}/{j['id']}/{track}.{j['ext']}"
+
+def do_conv(jid):
+    """Mod „doar tonalitate/tempo”: convertește originalul, fără separare."""
+    j = jobs.get(jid)
+    if not j: return
+    j["status"], j["progress"] = "processing", 50; save()
+    od = os.path.join(OUT, jid); os.makedirs(od, exist_ok=True)
+    try:
+        ff(["-i", j["path"], "-vn", "-map", "0:a:0", *ENC[j["fmt"]], f"{od}/original.{j['fmt']}"])
+        j.update(status="done", progress=100, ext=j["fmt"], finished=time.time(), ana="queued")
+    except Exception as e:
+        j.update(status="error", error=str(e)[-400:])
+    finally:
+        try: os.remove(j["path"])
+        except Exception: pass
+        save()
+    if j["status"] == "done": do_ana(jid)
+
+def do_ana(jid):
+    j = jobs.get(jid)
+    if not j or j.get("status") != "done": return
+    j["ana"] = "processing"; save()
+    src = track_file(j, "original" if j.get("mode") == "ana" else "instrumental")
+    tmp = f"{OUT}/{jid}/_ana.wav"
+    try:
+        ff(["-i", src, "-ac", "1", "-ar", "22050", "-t", "900", tmp])
+        r = subprocess.run([PY, f"{BASE}/analyze.py", tmp], capture_output=True, text=True, timeout=900)
+        res = json.loads(r.stdout.strip().splitlines()[-1])
+        j.update(key=res["key"], kmode=res["kmode"], bpm=res["bpm"], ana="done")
+    except Exception as e:
+        j["ana"] = "error"; print("analiză eșuată:", jid, e, flush=True)
+    finally:
+        try: os.remove(tmp)
+        except Exception: pass
+        save()
+
+def atempo_chain(x):
+    parts = []
+    while x > 2.0: parts.append("atempo=2.0"); x /= 2.0
+    while x < 0.5: parts.append("atempo=0.5"); x /= 0.5
+    parts.append(f"atempo={x:.6f}")
+    return ",".join(parts)
+
+def do_shift(jid, sid):
+    j = jobs.get(jid)
+    if not j: return
+    s = next((x for x in j.get("shifts", []) if x["id"] == sid), None)
+    if not s: return
+    s["status"] = "processing"; save()
+    P, T = 2 ** (s["semi"] / 12), s["tempo"] / 100
+    try:
+        if HAS_RB:
+            af = f"rubberband=pitch={P:.6f}:tempo={T:.4f}:pitchq=quality"
+            if s["track"] == "vocals": af += ":formant=preserved"
+        else:
+            sr = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+                                 "stream=sample_rate", "-of", "csv=p=0", track_file(j, s["track"])],
+                                capture_output=True, text=True).stdout.strip() or "44100"
+            sr = int(sr)
+            af = f"asetrate={sr * P:.0f},aresample={sr},{atempo_chain(T / P)}"
+        out = f"{OUT}/{jid}/shift_{sid}.{j['ext']}"
+        ff(["-i", track_file(j, s["track"]), "-vn", "-af", af, *ENC[j["ext"]], out])
+        s["status"] = "done"
+    except Exception as e:
+        s.update(status="error", error=str(e)[-300:])
+    finally:
+        save()
+
+def fx_worker():
+    while True:
+        t = fxq.get()
+        try:
+            {"conv": do_conv, "ana": do_ana, "shift": do_shift}[t[0]](*t[1:])
+        except Exception as e:
+            print("fx eroare:", t, e, flush=True)
+
 @app.route("/")
 def index():
     o = lambda d: "".join(f'<option value="{k}">{v}</option>' for k, v in d.items())
@@ -206,15 +329,19 @@ def index():
 def upload():
     model = request.form.get("model", "htdemucs")
     fmt = request.form.get("fmt", "mp3")
-    if model not in MODELS or fmt not in FMTS: abort(400)
+    mode = request.form.get("mode", "sep")
+    if model not in MODELS or fmt not in FMTS or mode not in ("sep", "ana"): abort(400)
     ids = []
     for f in request.files.getlist("files"):
         if not f.filename: continue
         ext = os.path.splitext(f.filename)[1].lower() or ".bin"
-        jid = new_job(type="sep", name=os.path.splitext(f.filename)[0], path="", model=model, fmt=fmt)
+        jid = new_job(type="sep", mode=mode, name=os.path.splitext(f.filename)[0], path="",
+                      model=model if mode == "sep" else "—", fmt=fmt)
         path = os.path.join(UP, jid + ext); f.save(path)
         jobs[jid]["path"] = path
-        sq.put(jid); ids.append(jid)
+        if mode == "ana": fxq.put(("conv", jid))
+        else: sq.put(jid)
+        ids.append(jid)
     save()
     return jsonify(ids)
 
@@ -235,7 +362,9 @@ def yt():
 @app.route("/jobs")
 def list_jobs():
     pos = {jid: i + 1 for qq in (sq, yq) for i, jid in enumerate(list(qq.queue))}
-    keys = ("id", "type", "name", "model", "fmt", "status", "progress", "error", "ext")
+    for i, t in enumerate([t for t in list(fxq.queue) if t[0] == "conv"]): pos[t[1]] = i + 1
+    keys = ("id", "type", "mode", "name", "model", "fmt", "status", "progress", "error", "ext",
+            "ana", "key", "kmode", "bpm", "shifts")
     with lock: js = sorted(jobs.values(), key=lambda x: -x["created"])
     return jsonify([{**{k: j.get(k) for k in keys}, "queue_pos": pos.get(j["id"], 0)} for j in js])
 
@@ -248,11 +377,45 @@ def dl(jid, kind):
         if kind != "file" or not os.path.exists(j.get("file", "")): abort(404)
         return send_file(j["file"], as_attachment=not play,
                          download_name=f"{j['name']}.{j['ext']}", conditional=True)
-    if kind not in ("vocals", "instrumental"): abort(404)
-    f = f"{OUT}/{jid}/{kind}.{j['ext']}"
-    label = "Voce" if kind == "vocals" else "Instrumental"
+    if kind.startswith("s_"):
+        s = next((x for x in j.get("shifts", []) if x["id"] == kind[2:]), None)
+        if not s or s["status"] != "done": abort(404)
+        f = f"{OUT}/{jid}/shift_{s['id']}.{j['ext']}"
+        label = f"{TRACK_LABEL[s['track']]} ({s['semi']:+d} st, {s['tempo']}%)"
+    elif kind in TRACK_LABEL:
+        f, label = track_file(j, kind), TRACK_LABEL[kind]
+    else: abort(404)
+    if not os.path.exists(f): abort(404)
     return send_file(f, as_attachment=not play,
                      download_name=f"{j['name']} - {label}.{j['ext']}", conditional=True)
+
+@app.route("/shift/<jid>", methods=["POST"])
+def shift(jid):
+    j = jobs.get(jid)
+    if not j or j.get("type") != "sep" or j["status"] != "done": abort(404)
+    try:
+        semi = max(-12, min(12, int(request.form.get("semi", 0))))
+        tempo = max(50, min(150, int(request.form.get("tempo", 100))))
+    except ValueError: abort(400)
+    track = request.form.get("track", "instrumental")
+    allowed = ("original",) if j.get("mode") == "ana" else ("instrumental", "vocals", "both")
+    if track not in allowed or (semi == 0 and tempo == 100): abort(400)
+    tracks = ["instrumental", "vocals"] if track == "both" else [track]
+    for t in tracks:
+        sid = uuid.uuid4().hex[:8]
+        j.setdefault("shifts", []).append(dict(id=sid, track=t, semi=semi, tempo=tempo, status="queued"))
+        fxq.put(("shift", jid, sid))
+    save()
+    return jsonify(ok=True)
+
+@app.route("/delshift/<jid>/<sid>", methods=["POST"])
+def delshift(jid, sid):
+    j = jobs.get(jid)
+    if j:
+        j["shifts"] = [s for s in j.get("shifts", []) if s["id"] != sid]
+        for f in glob.glob(f"{OUT}/{jid}/shift_{sid}.*"): os.remove(f)
+        save()
+    return jsonify(ok=True)
 
 @app.route("/delete/<jid>", methods=["POST"])
 def delete(jid):
@@ -295,6 +458,13 @@ audio{width:100%;margin:6px 0}video{width:100%;max-height:380px;border-radius:8p
 a.d{color:var(--ok);font-size:13px;text-decoration:none}
 .x{background:none;border:none;color:var(--mu);cursor:pointer;font-size:18px;padding:0 4px}
 .err{color:#ff6b6b;font-size:12px;margin-top:8px;white-space:pre-wrap;word-break:break-word}
+.ana{display:flex;gap:16px;flex-wrap:wrap;margin-top:12px;font-size:14px}.ana span{background:var(--bg);border-radius:8px;padding:6px 10px}
+.fx{background:var(--bg);border-radius:10px;padding:12px;margin-top:10px;display:grid;grid-template-columns:auto 1fr auto;gap:10px 12px;align-items:center;font-size:13px}
+.fx select{min-width:0}.fx input[type=range]{width:100%;accent-color:var(--ac)}.fx .v{color:var(--mu);white-space:nowrap;min-width:120px;text-align:right}
+.fx .acts{grid-column:1/-1;display:flex;gap:8px;justify-content:flex-end}.fx button{padding:8px 12px}
+@media(max-width:600px){.fx{grid-template-columns:1fr}.fx .v{text-align:left}}
+.sh{display:flex;flex-direction:column;gap:4px;margin-top:8px;background:var(--bg);border-radius:10px;padding:10px}
+.sh .top{flex-direction:row!important;align-items:center}.sh .top b{font-size:13px}
 </style></head><body><div class="w">
 <h1>🎤 Vocal Remover</h1><div class="sub">Separare voce / instrumental cu AI (Demucs) · Descărcare YouTube</div>
 <div class="tabs"><button class="t on" data-t="sep">🎤 Separare voce</button><button class="t" data-t="yt">▶️ YouTube</button></div>
@@ -303,7 +473,8 @@ a.d{color:var(--ok);font-size:13px;text-decoration:none}
 <div class="drop" id="drop">📂 Trage fișiere aici sau apasă pentru a alege<br>
 <small style="color:var(--mu)">MP3, WAV, FLAC, M4A, OGG, chiar și MP4/MKV</small>
 <input type="file" id="f" multiple accept="audio/*,video/*" hidden></div>
-<div class="row"><select id="m">%MODELS%</select>
+<div class="row"><select id="mode"><option value="sep">🎤 Separare voce + tonalitate/tempo</option><option value="ana">🎼 Doar tonalitate/tempo (fără separare)</option></select></div>
+<div class="row" style="margin-top:0"><select id="m">%MODELS%</select>
 <select id="fmt"><option value="mp3">MP3 320k</option><option value="wav">WAV</option><option value="flac">FLAC</option></select>
 <button class="p" id="go">Încarcă</button></div>
 <div id="sel" class="sub"></div>
@@ -333,6 +504,7 @@ drop.addEventListener('drop',ev=>{files=[...ev.dataTransfer.files];showSel()});
 function showSel(){$('#sel').textContent=files.length?files.length+' fișier(e): '+files.map(f=>f.name).join(', '):''}
 $('#go').onclick=()=>{if(!files.length)return alert('Alege fișiere!');
  const fd=new FormData();files.forEach(f=>fd.append('files',f));fd.append('model',$('#m').value);fd.append('fmt',$('#fmt').value);
+ fd.append('mode',$('#mode').value);
  const x=new XMLHttpRequest();x.open('POST','upload');
  x.upload.onprogress=e=>$('#sel').textContent='Încărcare: '+Math.round(e.loaded/e.total*100)+'%';
  x.onload=()=>{files=[];inp.value='';$('#sel').textContent='';load()};x.send(fd)};
@@ -346,30 +518,78 @@ $('#ygo').onclick=async()=>{const u=$('#urls').value.trim();if(!u)return alert('
  const r=await fetch('yt',{method:'POST',body:fd});if(!r.ok)return alert('Eroare server');
  const ids=await r.json();if(!ids.length)return alert('Niciun link valid');$('#urls').value='';load()};
 
+const syncMode=()=>{const a=$('#mode').value==='ana';$('#m').disabled=a;$('#m').style.opacity=a?.4:1;
+ try{localStorage.setItem('mode',$('#mode').value)}catch(e){}};
+try{const mm=localStorage.getItem('mode');if(mm)$('#mode').value=mm}catch(e){}
+$('#mode').onchange=syncMode;syncMode();
+
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+// ---------- tonalitate / tempo ----------
+const NT=['C','C#','D','Eb','E','F','F#','G','Ab','A','Bb','B'],RO=['Do','Do#','Re','Mi♭','Mi','Fa','Fa#','Sol','La♭','La','Si♭','Si'];
+const TL={vocals:'🎤 Voce',instrumental:'🎵 Instrumental',original:'🎧 Original'};
+const kn=(k,m,s=0)=>{const i=((k+s)%12+12)%12;return NT[i]+(m==='minor'?'m':'')+' · '+RO[i]+' '+m};
+const ks=(k,m,s=0)=>{const i=((k+s)%12+12)%12;return NT[i]+(m==='minor'?'m':'')};
+const ctl={},byId={};
+const C=j=>ctl[j.id]||(ctl[j.id]={semi:0,tempo:100,track:j.mode==='ana'?'original':'instrumental'});
+const sgn=n=>(n>0?'+':'')+n;
+function vSemi(j){const c=C(j);return sgn(c.semi)+' st'+(j.key!=null?' → '+ks(j.key,j.kmode,c.semi):'')}
+function vTempo(j){const c=C(j);return c.tempo+'%'+(j.bpm?' → '+Math.round(j.bpm*c.tempo/100)+' BPM':'')}
+function fx(j){const c=C(j);
+ const tr=j.mode==='ana'?[['original','Original']]:[['instrumental','Instrumental'],['vocals','Voce'],['both','Ambele']];
+ let ana='';
+ if(j.ana==='done')ana=`<div class="ana"><span>🎼 Tonalitate: <b>${kn(j.key,j.kmode)}</b></span><span>🥁 Tempo: <b>${j.bpm} BPM</b></span></div>`;
+ else if(j.ana==='error')ana=`<div class="ana"><span>⚠ Analiza tonalității a eșuat (poți transpune oricum)</span></div>`;
+ else ana=`<div class="ana"><span>🔎 Analizez tonalitatea și tempo-ul…</span></div>`;
+ const sh=(j.shifts||[]).map(s=>{const lab=`${TL[s.track]} · ${sgn(s.semi)} st${j.key!=null?' ('+ks(j.key,j.kmode,s.semi)+')':''} · ${s.tempo}%${j.bpm?' ('+Math.round(j.bpm*s.tempo/100)+' BPM)':''}`;
+  let b='';if(s.status==='done')b=`<audio controls preload="none" src="dl/${j.id}/s_${s.id}?play=1"></audio><a class="d" href="dl/${j.id}/s_${s.id}">⬇ Descarcă</a>`;
+  else if(s.status==='error')b=`<div class="err">${esc(s.error)}</div>`;else b=`<span class="st">⚙️ Procesare…</span>`;
+  return `<div class="sh"><div class="top"><b>${lab}</b><button class="x" title="Șterge" onclick="delShift('${j.id}','${s.id}')">✕</button></div>${b}</div>`}).join('');
+ return ana+`<div class="fx" data-id="${j.id}">
+  <span>Pistă</span><select data-k="track">${tr.map(([v,l])=>`<option value="${v}"${c.track===v?' selected':''}>${l}</option>`).join('')}</select><span></span>
+  <span>Ton</span><input type="range" min="-12" max="12" step="1" value="${c.semi}" data-k="semi"><span class="v" data-v="semi">${vSemi(j)}</span>
+  <span>Tempo</span><input type="range" min="50" max="150" step="1" value="${c.tempo}" data-k="tempo"><span class="v" data-v="tempo">${vTempo(j)}</span>
+  <div class="acts"><button onclick="resetFx('${j.id}')">Resetează</button><button class="p" onclick="applyFx('${j.id}')">Aplică</button></div></div>`+sh}
+const L=$('#list');let dragging=false;
+L.addEventListener('pointerdown',e=>{if(e.target.type==='range')dragging=true});
+addEventListener('pointerup',()=>{dragging=false});
+L.addEventListener('input',e=>{const b=e.target.closest('.fx');if(!b||!e.target.dataset.k)return;const j=byId[b.dataset.id],c=C(j),k=e.target.dataset.k;
+ c[k]=k==='track'?e.target.value:+e.target.value;
+ b.querySelector('[data-v=semi]').textContent=vSemi(j);b.querySelector('[data-v=tempo]').textContent=vTempo(j)});
+function resetFx(id){Object.assign(C(byId[id]),{semi:0,tempo:100});last='';load()}
+async function applyFx(id){const c=C(byId[id]);if(!c.semi&&c.tempo===100)return alert('Alege un ton sau un tempo diferit.');
+ const fd=new FormData();fd.append('semi',c.semi);fd.append('tempo',c.tempo);fd.append('track',c.track);
+ const r=await fetch('shift/'+id,{method:'POST',body:fd});if(!r.ok)return alert('Eroare server');last='';load()}
+async function delShift(id,sid){await fetch('delshift/'+id+'/'+sid,{method:'POST'});last='';load()}
+
 function card(j){const yt=j.type==='yt';
  const st={queued:'⏳ În așteptare'+(j.queue_pos?' (#'+j.queue_pos+')':''),processing:'⚙️ '+(yt?'Descărcare ':'Procesare ')+j.progress+'%',done:'✅ Gata',error:'❌ Eroare'}[j.status];
- const meta=yt?(j.fmt==='mp3'?'YouTube · MP3':'YouTube · '+(j.fmt==='best'?'max':j.fmt+'p')):j.model+' · '+j.fmt;
+ const meta=yt?(j.fmt==='mp3'?'YouTube · MP3':'YouTube · '+(j.fmt==='best'?'max':j.fmt+'p')):(j.mode==='ana'?'tonalitate/tempo':j.model)+' · '+j.fmt;
  let body='';
  if(j.status==='processing'||j.status==='queued')body=`<div class="bar"><i style="width:${j.progress}%"></i></div>`;
  if(j.status==='done'){
   if(yt){const s=`dl/${j.id}/file`;
    body=`<div class="res one"><div>${j.fmt==='mp3'?`<audio controls preload="none" src="${s}?play=1"></audio>`:`<video controls preload="none" src="${s}?play=1"></video>`}<a class="d" href="${s}">⬇ Descarcă</a></div></div>`}
-  else body=`<div class="res">${['vocals','instrumental'].map(k=>`<div><b>${k==='vocals'?'🎤 Voce':'🎵 Instrumental'}</b>
-   <audio controls preload="none" src="dl/${j.id}/${k}?play=1"></audio><a class="d" href="dl/${j.id}/${k}">⬇ Descarcă</a></div>`).join('')}</div>`}
+  else{const tk=j.mode==='ana'?['original']:['vocals','instrumental'];
+   body=`<div class="res${tk.length===1?' one':''}">${tk.map(k=>`<div><b>${TL[k]}</b>
+   <audio controls preload="none" src="dl/${j.id}/${k}?play=1"></audio><a class="d" href="dl/${j.id}/${k}">⬇ Descarcă</a></div>`).join('')}</div>`+fx(j)}}
  if(j.status==='error')body=`<div class="err">${esc(j.error)}</div>`;
  return `<div class="job"><div class="top"><div class="nm">${yt?'▶️':'🎤'} ${esc(j.name)}</div>
   <div><span class="st">${st} · ${esc(meta)}</span><button class="x" title="Șterge" onclick="del('${j.id}')">✕</button></div></div>${body}</div>`}
-async function load(){try{const d=await (await fetch('jobs')).json();$('#list').innerHTML=d.map(card).join('')}catch(e){}}
-// nu reîncarcă lista cât timp rulează audio/video
-setInterval(()=>{if(![...document.querySelectorAll('audio,video')].some(a=>!a.paused))load()},2500);
-async function del(id){if(confirm('Ștergi?')){await fetch('delete/'+id,{method:'POST'});load()}}
+let last='';
+async function load(){try{const t=await (await fetch('jobs')).text();if(t===last)return;last=t;
+ const d=JSON.parse(t);d.forEach(j=>byId[j.id]=j);L.innerHTML=d.map(card).join('')}catch(e){}}
+// nu reîncarcă lista cât timp rulează audio/video sau ajustezi ton/tempo
+const busy=()=>dragging||[...document.querySelectorAll('audio,video')].some(a=>!a.paused)||
+ (document.activeElement&&document.activeElement.tagName==='SELECT'&&L.contains(document.activeElement));
+setInterval(()=>{if(!busy())load()},2500);
+async function del(id){if(confirm('Ștergi?')){await fetch('delete/'+id,{method:'POST'});last='';load()}}
 load();
 </script></body></html>"""
 
 load()
 threading.Thread(target=sep_worker, daemon=True).start()
 threading.Thread(target=yt_worker, daemon=True).start()
+threading.Thread(target=fx_worker, daemon=True).start()
 
 if __name__ == "__main__":
     from waitress import serve
@@ -404,6 +624,7 @@ WorkingDirectory=$BASE
 Environment=PORT=$PORT
 Environment=OMP_NUM_THREADS=$(nproc)
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:$BASE/venv/bin
+Environment=NUMBA_CACHE_DIR=$BASE/.numba
 ExecStart=$BASE/venv/bin/python $BASE/app.py
 Restart=always
 Nice=10
