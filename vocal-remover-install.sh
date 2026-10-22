@@ -187,6 +187,7 @@ def sep_worker():
             for d in glob.glob(f"{od}/*/"): shutil.rmtree(d, ignore_errors=True)
             j.update(status="done", progress=100, ext=ext, finished=time.time(), ana="queued")
             fxq.put(("ana", jid))
+            auto_shift(j)
         except Exception as e:
             j.update(status="error", error=str(e)[-400:])
         finally:
@@ -253,6 +254,7 @@ def do_conv(jid):
     try:
         ff(["-i", j["path"], "-vn", "-map", "0:a:0", *ENC[j["fmt"]], f"{od}/original.{j['fmt']}"])
         j.update(status="done", progress=100, ext=j["fmt"], finished=time.time(), ana="queued")
+        auto_shift(j)
     except Exception as e:
         j.update(status="error", error=str(e)[-400:])
     finally:
@@ -311,6 +313,17 @@ def do_shift(jid, sid):
     finally:
         save()
 
+def add_shifts(j, semi, tempo, track):
+    tracks = ["instrumental", "vocals"] if track == "both" else [track]
+    for t in tracks:
+        sid = uuid.uuid4().hex[:8]
+        j.setdefault("shifts", []).append(dict(id=sid, track=t, semi=semi, tempo=tempo, status="queued"))
+        fxq.put(("shift", j["id"], sid))
+
+def auto_shift(j):
+    a = j.pop("auto", None)
+    if a: add_shifts(j, a["semi"], a["tempo"], "original" if j.get("mode") == "ana" else a["track"])
+
 def fx_worker():
     while True:
         t = fxq.get()
@@ -331,6 +344,13 @@ def upload():
     fmt = request.form.get("fmt", "mp3")
     mode = request.form.get("mode", "sep")
     if model not in MODELS or fmt not in FMTS or mode not in ("sep", "ana"): abort(400)
+    try:
+        semi = max(-12, min(12, int(request.form.get("semi", 0))))
+        tempo = max(50, min(150, int(request.form.get("tempo", 100))))
+    except ValueError: abort(400)
+    track = request.form.get("track", "instrumental")
+    if track not in ("instrumental", "vocals", "both"): track = "instrumental"
+    auto = dict(semi=semi, tempo=tempo, track=track) if (semi or tempo != 100) else None
     ids = []
     for f in request.files.getlist("files"):
         if not f.filename: continue
@@ -339,6 +359,7 @@ def upload():
                       model=model if mode == "sep" else "—", fmt=fmt)
         path = os.path.join(UP, jid + ext); f.save(path)
         jobs[jid]["path"] = path
+        if auto: jobs[jid]["auto"] = dict(auto)
         if mode == "ana": fxq.put(("conv", jid))
         else: sq.put(jid)
         ids.append(jid)
@@ -400,11 +421,7 @@ def shift(jid):
     track = request.form.get("track", "instrumental")
     allowed = ("original",) if j.get("mode") == "ana" else ("instrumental", "vocals", "both")
     if track not in allowed or (semi == 0 and tempo == 100): abort(400)
-    tracks = ["instrumental", "vocals"] if track == "both" else [track]
-    for t in tracks:
-        sid = uuid.uuid4().hex[:8]
-        j.setdefault("shifts", []).append(dict(id=sid, track=t, semi=semi, tempo=tempo, status="queued"))
-        fxq.put(("shift", jid, sid))
+    add_shifts(j, semi, tempo, track)
     save()
     return jsonify(ok=True)
 
@@ -463,6 +480,7 @@ a.d{color:var(--ok);font-size:13px;text-decoration:none}
 .fx select{min-width:0}.fx input[type=range]{width:100%;accent-color:var(--ac)}.fx .v{color:var(--mu);white-space:nowrap;min-width:120px;text-align:right}
 .fx .acts{grid-column:1/-1;display:flex;gap:8px;justify-content:flex-end}.fx button{padding:8px 12px}
 @media(max-width:600px){.fx{grid-template-columns:1fr}.fx .v{text-align:left}}
+.fx.up{background:var(--card);border:1px solid var(--bd);margin:0 0 14px}
 .sh{display:flex;flex-direction:column;gap:4px;margin-top:8px;background:var(--bg);border-radius:10px;padding:10px}
 .sh .top{flex-direction:row!important;align-items:center}.sh .top b{font-size:13px}
 </style></head><body><div class="w">
@@ -477,6 +495,13 @@ a.d{color:var(--ok);font-size:13px;text-decoration:none}
 <div class="row" style="margin-top:0"><select id="m">%MODELS%</select>
 <select id="fmt"><option value="mp3">MP3 320k</option><option value="wav">WAV</option><option value="flac">FLAC</option></select>
 <button class="p" id="go">Încarcă</button></div>
+<div class="fx up">
+  <b style="grid-column:1/-1;font-size:14px">🎼 Tonalitate și tempo <span class="st">(se aplică automat după procesare · 0 st și 100% = neschimbat)</span></b>
+  <span>Pistă</span><select id="utrack"><option value="instrumental">Instrumental</option><option value="vocals">Voce</option><option value="both">Ambele</option></select><span></span>
+  <span>Ton</span><input type="range" id="usemi" min="-12" max="12" step="1" value="0"><span class="v" id="vsemi">0 st</span>
+  <span>Tempo</span><input type="range" id="utempo" min="50" max="150" step="1" value="100"><span class="v" id="vtempo">100%</span>
+  <div class="acts"><button onclick="uReset()">Resetează</button></div>
+</div>
 <div id="sel" class="sub"></div>
 </section>
 
@@ -505,6 +530,7 @@ function showSel(){$('#sel').textContent=files.length?files.length+' fișier(e):
 $('#go').onclick=()=>{if(!files.length)return alert('Alege fișiere!');
  const fd=new FormData();files.forEach(f=>fd.append('files',f));fd.append('model',$('#m').value);fd.append('fmt',$('#fmt').value);
  fd.append('mode',$('#mode').value);
+ fd.append('semi',$('#usemi').value);fd.append('tempo',$('#utempo').value);fd.append('track',$('#utrack').value);
  const x=new XMLHttpRequest();x.open('POST','upload');
  x.upload.onprogress=e=>$('#sel').textContent='Încărcare: '+Math.round(e.loaded/e.total*100)+'%';
  x.onload=()=>{files=[];inp.value='';$('#sel').textContent='';load()};x.send(fd)};
@@ -518,7 +544,11 @@ $('#ygo').onclick=async()=>{const u=$('#urls').value.trim();if(!u)return alert('
  const r=await fetch('yt',{method:'POST',body:fd});if(!r.ok)return alert('Eroare server');
  const ids=await r.json();if(!ids.length)return alert('Niciun link valid');$('#urls').value='';load()};
 
+const uLab=()=>{const s=+$('#usemi').value;$('#vsemi').textContent=(s>0?'+':'')+s+' st';$('#vtempo').textContent=$('#utempo').value+'%'};
+$('#usemi').oninput=uLab;$('#utempo').oninput=uLab;
+function uReset(){$('#usemi').value=0;$('#utempo').value=100;uLab()}
 const syncMode=()=>{const a=$('#mode').value==='ana';$('#m').disabled=a;$('#m').style.opacity=a?.4:1;
+ $('#utrack').disabled=a;$('#utrack').style.opacity=a?.4:1;
  try{localStorage.setItem('mode',$('#mode').value)}catch(e){}};
 try{const mm=localStorage.getItem('mode');if(mm)$('#mode').value=mm}catch(e){}
 $('#mode').onchange=syncMode;syncMode();
