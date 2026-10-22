@@ -17,6 +17,7 @@ Separare **voce / instrumental** cu AI ([Demucs](https://github.com/facebookrese
 - ⏳ Coadă de procesare, păstrată și după restart
 - 🔁 Serviciu systemd, pornește automat la boot
 - 📱 Interfață responsive (merge și pe telefon)
+- 🥁 Mod **4 piste**: Voce, Tobe, Bas, Altele (pian, chitară, synth) + Instrumental complet
 
 ### 🎼 Tonalitate și tempo
 - Detectează automat **tonalitatea** (ex. `Am · La minor`) și **BPM-ul** fiecărei melodii
@@ -32,6 +33,12 @@ Separare **voce / instrumental** cu AI ([Demucs](https://github.com/facebookrese
 - 3 modele: `small` (rapid), `medium` (recomandat), `large-v3-turbo` (cel mai precis)
 - Fișierul se numește `Film.ro.srt`, gata de pus lângă film în Jellyfin / Plex
 - Modelul se descarcă automat la prima utilizare (~0.5–1.6 GB)
+
+### 📺 Integrare CineVerse
+Dacă pe server rulează [CineVerse](https://github.com/maxvideostar/CineVerse), installer-ul îi citește automat folderele media și dă drepturile necesare:
+- **Subtitrări direct din bibliotecă**: cauți filmul sau episodul în CineVerse și îl transcrii fără upload; `Film.ro.srt` se pune automat lângă film
+- **„Trimite în CineVerse”** pentru subtitrări generate din fișiere încărcate (alegi filmul) și pentru clipuri video YouTube (alegi biblioteca și, opțional, un subfolder)
+- CineVerse detectează automat fișierele noi (copiere atomică, fără fișiere incomplete)
 
 ### ▶️ YouTube
 - Lipești unul sau mai multe link-uri (unul pe linie)

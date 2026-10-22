@@ -142,7 +142,12 @@ YT_FMTS = {"mp3": "🎵 MP3 320k", "best": "🎬 Video – calitate maximă (pâ
            "1080": "🎬 Video MP4 1080p", "720": "🎬 Video MP4 720p", "480": "🎬 Video MP4 480p"}
 JUNK = (".part", ".ytdl", ".webp", ".jpg", ".jpeg", ".png", ".temp")
 ENC = {"mp3": ["-c:a", "libmp3lame", "-b:a", "320k"], "wav": ["-c:a", "pcm_s16le"], "flac": ["-c:a", "flac"]}
-TRACK_LABEL = {"vocals": "Voce", "instrumental": "Instrumental", "original": "Original"}
+TRACK_LABEL = {"vocals": "Voce", "instrumental": "Instrumental", "original": "Original",
+               "drums": "Tobe", "bass": "Bas", "other": "Altele"}
+STEMS4 = ("drums", "bass", "other")
+def job_tracks(j):
+    m = j.get("mode", "sep")
+    return ["original"] if m == "ana" else ["vocals", "instrumental", *STEMS4] if m == "sep4" else ["vocals", "instrumental"]
 try:
     HAS_RB = "rubberband" in subprocess.run(["ffmpeg", "-hide_banner", "-filters"],
                                             capture_output=True, text=True).stdout
@@ -184,7 +189,7 @@ def load():
             j["progress"] = 0
             if j["type"] == "yt":
                 j["status"] = "queued"; yq.put(jid)
-            elif j["type"] == "sub" and os.path.exists(j.get("path", "")):
+            elif j["type"] == "sub" and os.path.exists(j.get("path", "")) and (not j.get("cvsrc") or cv_inside(j["path"])):
                 j["status"] = "queued"; wq.put(jid)
             elif j["type"] == "sub":
                 j["status"], j["error"] = "error", "Întrerupt la restart"
@@ -221,16 +226,25 @@ def sep_worker():
         if not j: continue
         j["status"], j["progress"] = "processing", 0; save()
         od = os.path.join(OUT, jid)
-        cmd = [PY, "-m", "demucs", "--two-stems=vocals", "-n", j["model"],
+        four = j.get("mode") == "sep4"
+        cmd = [PY, "-m", "demucs", *([] if four else ["--two-stems=vocals"]), "-n", j["model"],
                "-o", od, *FMTS[j["fmt"]], j["path"]]
         try:
             with heavy: rc, log = run(cmd, j, r"(\d+)%\|")
-            v = glob.glob(f"{od}/*/*/vocals.*"); n = glob.glob(f"{od}/*/*/no_vocals.*")
+            v = glob.glob(f"{od}/*/*/vocals.*")
+            n = glob.glob(f"{od}/*/*/other.*" if four else f"{od}/*/*/no_vocals.*")
             if rc != 0 or not v or not n:
                 raise RuntimeError("".join(log[-5:]) or "Demucs a eșuat")
             ext = v[0].rsplit(".", 1)[1]
             shutil.move(v[0], f"{od}/vocals.{ext}")
-            shutil.move(n[0], f"{od}/instrumental.{ext}")
+            if four:
+                for st in STEMS4:
+                    shutil.move(glob.glob(f"{od}/*/*/{st}.*")[0], f"{od}/{st}.{ext}")
+                # instrumental = tobe + bas + altele
+                ff(["-i", f"{od}/drums.{ext}", "-i", f"{od}/bass.{ext}", "-i", f"{od}/other.{ext}",
+                    "-filter_complex", "amix=inputs=3:normalize=0", *ENC[ext], f"{od}/instrumental.{ext}"])
+            else:
+                shutil.move(n[0], f"{od}/instrumental.{ext}")
             for d in glob.glob(f"{od}/*/"): shutil.rmtree(d, ignore_errors=True)
             j.update(status="done", progress=100, ext=ext, finished=time.time(), ana="queued")
             fxq.put(("ana", jid))
@@ -265,11 +279,15 @@ def sub_worker():
                 err = [l for l in log if "Error" in l or "error" in l]
                 raise RuntimeError("\n".join(err[-3:] or log[-6:]) or "Whisper a eșuat")
             j.update(status="done", progress=100, finished=time.time())
+            if j.get("cvsrc"):
+                try: cv_put_sub(j, j["path"])
+                except Exception as e: j["cverr"] = str(e)[-200:]
         except Exception as e:
             j.update(status="error", error=str(e)[-400:])
         finally:
-            try: os.remove(j["path"])
-            except Exception: pass
+            if not j.get("cvsrc"):
+                try: os.remove(j["path"])
+                except Exception: pass
             save()
 
 def yt_worker():
@@ -302,7 +320,7 @@ def yt_worker():
             j.update(status="done", progress=100, file=fp, ext=fp.rsplit(".", 1)[1].lower(),
                      name=os.path.splitext(os.path.basename(fp))[0], finished=time.time())
             if j.get("sep") and f == "mp3":
-                sid = new_job(type="sep", name=j["name"], path="", model=j.get("model", "htdemucs"), fmt="mp3")
+                sid = new_job(type="sep", mode="sep", name=j["name"], path="", model=j.get("model", "htdemucs"), fmt="mp3")
                 path = os.path.join(UP, sid + ".mp3")
                 shutil.copy(fp, path)
                 jobs[sid]["path"] = path
@@ -401,6 +419,51 @@ def auto_shift(j):
     a = j.pop("auto", None)
     if a: add_shifts(j, a["semi"], a["tempo"], "original" if j.get("mode") == "ana" else a["track"])
 
+# ---------- CineVerse ----------
+CVCONF = f"{BASE}/cineverse.json"
+_cvcache = {"t": 0, "files": []}
+def cv_dirs():
+    try: return [d for d in json.load(open(CVCONF)).get("dirs", []) if os.path.isdir(d)]
+    except Exception: return []
+
+def cv_inside(path):
+    rp = os.path.realpath(path)
+    return any(rp == os.path.realpath(d) or rp.startswith(os.path.realpath(d) + os.sep) for d in cv_dirs())
+
+def cv_files():
+    if time.time() - _cvcache["t"] < 120: return _cvcache["files"]
+    out = []
+    for root in cv_dirs():
+        for dp, dn, fn in os.walk(root, followlinks=True):
+            dn[:] = [d for d in dn if not d.startswith(".") and d.lower() not in ("sample", "samples", "extras")]
+            for f in fn:
+                if os.path.splitext(f)[1].lower() in CV_VIDEO and not f.startswith(".") and "sample" not in f.lower():
+                    out.append(os.path.join(dp, f))
+    out.sort(key=lambda x: x.lower())
+    _cvcache.update(t=time.time(), files=out)
+    return out
+CV_VIDEO = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".wmv", ".ts", ".m2ts", ".webm", ".mpg", ".mpeg"}
+
+def cv_copy(src, dst):
+    """Copiază atomic (fișier ascuns .part -> redenumire), ca CineVerse să-l vadă doar complet."""
+    tmp = os.path.join(os.path.dirname(dst), "." + os.path.basename(dst) + ".part")
+    shutil.copyfile(src, tmp)
+    os.chmod(tmp, 0o664)
+    os.replace(tmp, dst)
+    _cvcache["t"] = 0
+
+def safe_name(n):
+    return re.sub(r'[\\/:*?"<>|]+', " ", n).strip()[:150] or "video"
+
+def cv_put_sub(j, video):
+    lg = j.get("dlang") or "und"
+    stem = os.path.splitext(video)[0]
+    dst = f"{stem}.{lg}.srt"
+    if os.path.exists(dst): dst = f"{stem}.{lg}.whisper.srt"
+    cv_copy(f"{OUT}/{j['id']}/sub.srt", dst)
+    j["cv"] = dst
+    return dst
+
 def fx_worker():
     while True:
         t = fxq.get()
@@ -421,7 +484,7 @@ def upload():
     model = request.form.get("model", "htdemucs")
     fmt = request.form.get("fmt", "mp3")
     mode = request.form.get("mode", "sep")
-    if model not in MODELS or fmt not in FMTS or mode not in ("sep", "ana"): abort(400)
+    if model not in MODELS or fmt not in FMTS or mode not in ("sep", "sep4", "ana"): abort(400)
     try:
         semi = max(-12, min(12, int(request.form.get("semi", 0))))
         tempo = max(50, min(150, int(request.form.get("tempo", 100))))
@@ -434,7 +497,7 @@ def upload():
         if not f.filename: continue
         ext = os.path.splitext(f.filename)[1].lower() or ".bin"
         jid = new_job(type="sep", mode=mode, name=os.path.splitext(f.filename)[0], path="",
-                      model=model if mode == "sep" else "—", fmt=fmt)
+                      model=model if mode != "ana" else "—", fmt=fmt)
         path = os.path.join(UP, jid + ext); f.save(path)
         jobs[jid]["path"] = path
         if auto: jobs[jid]["auto"] = dict(auto)
@@ -460,6 +523,64 @@ def subupload():
     save()
     return jsonify(ids)
 
+@app.route("/cv")
+def cv_info():
+    ds = cv_dirs()
+    return jsonify(enabled=bool(ds), dirs=[{"i": i, "name": os.path.basename(d.rstrip("/")) or d, "path": d} for i, d in enumerate(ds)])
+
+@app.route("/cv/videos")
+def cv_videos():
+    words = request.args.get("q", "").lower().split()
+    roots = cv_dirs(); res = []
+    for f in cv_files():
+        rel = f
+        for r in roots:
+            if f.startswith(r.rstrip("/") + "/"): rel = f[len(r.rstrip("/")) + 1:]; break
+        if all(w in rel.lower() for w in words):
+            res.append({"path": f, "rel": rel})
+            if len(res) >= 60: break
+    return jsonify(res)
+
+@app.route("/subcv", methods=["POST"])
+def subcv():
+    wm, lang = request.form.get("wmodel", "medium"), request.form.get("lang", "auto")
+    task = request.form.get("task", "transcribe")
+    if wm not in WMODELS or lang not in WLANGS or task not in ("transcribe", "translate"): abort(400)
+    ids = []
+    for pth in request.form.getlist("paths"):
+        if not (os.path.isfile(pth) and cv_inside(pth)): continue
+        jid = new_job(type="sub", name=os.path.splitext(os.path.basename(pth))[0], path=pth, cvsrc=True,
+                      wmodel=wm, lang=lang, task=task)
+        wq.put(jid); ids.append(jid)
+    save()
+    return jsonify(ids)
+
+@app.route("/cv/send/<jid>", methods=["POST"])
+def cv_send(jid):
+    j = jobs.get(jid)
+    if not j or j["status"] != "done": abort(404)
+    ds = cv_dirs()
+    if not ds: return jsonify(ok=False, error="CineVerse nu e configurat"), 400
+    try:
+        if j["type"] == "sub":
+            v = request.form.get("video", "")
+            if not (os.path.isfile(v) and cv_inside(v)): return jsonify(ok=False, error="Alege un film din CineVerse"), 400
+            dst = cv_put_sub(j, v)
+        elif j["type"] == "yt" and j.get("ext") in ("mp4", "mkv", "webm"):
+            i = int(request.form.get("dir", 0))
+            if not 0 <= i < len(ds): abort(400)
+            sub = safe_name(request.form.get("sub", "").strip()) if request.form.get("sub", "").strip() else ""
+            d = os.path.join(ds[i], sub) if sub else ds[i]
+            os.makedirs(d, exist_ok=True)
+            dst = os.path.join(d, safe_name(j["name"]) + "." + j["ext"])
+            cv_copy(j["file"], dst); j["cv"] = dst
+        else:
+            abort(400)
+    except PermissionError:
+        return jsonify(ok=False, error="Fără drept de scriere în folderul CineVerse (rulează din nou installer-ul)"), 400
+    save()
+    return jsonify(ok=True, path=dst)
+
 @app.route("/yt", methods=["POST"])
 def yt():
     fmt = request.form.get("fmt", "mp3")
@@ -479,7 +600,7 @@ def list_jobs():
     pos = {jid: i + 1 for qq in (sq, yq, wq) for i, jid in enumerate(list(qq.queue))}
     for i, t in enumerate([t for t in list(fxq.queue) if t[0] == "conv"]): pos[t[1]] = i + 1
     keys = ("id", "type", "mode", "name", "model", "fmt", "status", "progress", "error", "ext",
-            "ana", "key", "kmode", "bpm", "shifts", "wmodel", "lang", "task", "dlang", "segs", "stage")
+            "ana", "key", "kmode", "bpm", "shifts", "wmodel", "lang", "task", "dlang", "segs", "stage", "cv", "cvsrc", "cverr")
     with lock: js = sorted(jobs.values(), key=lambda x: -x["created"])
     return jsonify([{**{k: j.get(k) for k in keys}, "queue_pos": pos.get(j["id"], 0)} for j in js])
 
@@ -520,7 +641,7 @@ def shift(jid):
         tempo = max(50, min(150, int(request.form.get("tempo", 100))))
     except ValueError: abort(400)
     track = request.form.get("track", "instrumental")
-    allowed = ("original",) if j.get("mode") == "ana" else ("instrumental", "vocals", "both")
+    allowed = ("original",) if j.get("mode") == "ana" else (*job_tracks(j), "both")
     if track not in allowed or (semi == 0 and tempo == 100): abort(400)
     add_shifts(j, semi, tempo, track)
     save()
@@ -582,6 +703,13 @@ a.d{color:var(--ok);font-size:13px;text-decoration:none}
 .fx .acts{grid-column:1/-1;display:flex;gap:8px;justify-content:flex-end}.fx button{padding:8px 12px}
 @media(max-width:600px){.fx{grid-template-columns:1fr}.fx .v{text-align:left}}
 .fx.up{background:var(--card);border:1px solid var(--bd);margin:0 0 14px}
+#cvq{width:100%;background:var(--card);color:var(--tx);border:1px solid var(--bd);border-radius:10px;padding:10px 12px;font-size:14px}
+#cvres{max-height:260px;overflow:auto;margin-top:6px}
+.cvi{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:8px;cursor:pointer;font-size:13px;word-break:break-all}
+.cvi:hover{background:var(--card)}.cvi input{flex:none}
+.cvbox{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
+.cvbox select,.cvbox input{flex:1;min-width:140px;background:var(--card);color:var(--tx);border:1px solid var(--bd);border-radius:10px;padding:8px 10px;font-size:13px}
+.ok{color:var(--ok);font-size:13px;margin-top:8px;word-break:break-all}
 .sh{display:flex;flex-direction:column;gap:4px;margin-top:8px;background:var(--bg);border-radius:10px;padding:10px}
 .sh .top{flex-direction:row!important;align-items:center}.sh .top b{font-size:13px}
 </style></head><body><div class="w">
@@ -592,7 +720,7 @@ a.d{color:var(--ok);font-size:13px;text-decoration:none}
 <div class="drop" id="drop">📂 Trage fișiere aici sau apasă pentru a alege<br>
 <small style="color:var(--mu)">MP3, WAV, FLAC, M4A, OGG, chiar și MP4/MKV</small>
 <input type="file" id="f" multiple accept="audio/*,video/*" hidden></div>
-<div class="row"><select id="mode"><option value="sep">🎤 Separare voce + tonalitate/tempo</option><option value="ana">🎼 Doar tonalitate/tempo (fără separare)</option></select></div>
+<div class="row"><select id="mode"><option value="sep">🎤 Separare voce + tonalitate/tempo</option><option value="sep4">🥁 Separare 4 piste: voce, tobe, bas, altele</option><option value="ana">🎼 Doar tonalitate/tempo (fără separare)</option></select></div>
 <div class="row" style="margin-top:0"><select id="m">%MODELS%</select>
 <select id="fmt"><option value="mp3">MP3 320k</option><option value="wav">WAV</option><option value="flac">FLAC</option></select>
 <button class="p" id="go">Încarcă</button></div>
@@ -610,6 +738,10 @@ a.d{color:var(--ok);font-size:13px;text-decoration:none}
 <div class="drop" id="sdrop">📝 Trage aici filme, clipuri sau audio pentru subtitrare<br>
 <small style="color:var(--mu)">MP4, MKV, AVI, MP3, WAV… · rezultat SRT / VTT / TXT</small>
 <input type="file" id="sf" multiple accept="audio/*,video/*,.mkv,.avi,.ts" hidden></div>
+<div id="cvpick" hidden style="margin-top:12px">
+ <input id="cvq" placeholder="🔎 Sau caută un film / episod direct din CineVerse (fără upload)…">
+ <div id="cvres"></div>
+</div>
 <div class="row"><select id="wm">%WMODELS%</select><select id="wl">%WLANGS%</select>
 <select id="wt"><option value="transcribe">Transcriere (aceeași limbă)</option><option value="translate">Traducere în engleză</option></select>
 <button class="p" id="sgo">Generează</button></div>
@@ -655,7 +787,32 @@ sinp.onchange=()=>{sfiles=[...sinp.files];sShow()};
 ['dragleave','drop'].forEach(e=>sdrop.addEventListener(e,ev=>{ev.preventDefault();sdrop.classList.remove('on')}));
 sdrop.addEventListener('drop',ev=>{sfiles=[...ev.dataTransfer.files];sShow()});
 try{const v=JSON.parse(localStorage.getItem('wopt')||'{}');for(const k of ['wm','wl','wt'])if(v[k])$('#'+k).value=v[k]}catch(e){}
-$('#sgo').onclick=()=>{if(!sfiles.length)return alert('Alege fișiere!');
+// ---- CineVerse ----
+let CV={enabled:false,dirs:[]};const cvSel=new Set();
+fetch('cv').then(r=>r.json()).then(d=>{CV=d;$('#cvpick').hidden=!d.enabled;last='';load()}).catch(()=>{});
+let cvT;$('#cvq').oninput=()=>{clearTimeout(cvT);cvT=setTimeout(cvSearch,300)};
+async function cvSearch(){const q=$('#cvq').value.trim();if(q.length<2){$('#cvres').innerHTML='';return}
+ const d=await (await fetch('cv/videos?q='+encodeURIComponent(q))).json();
+ $('#cvres').innerHTML=d.length?d.map(v=>`<label class="cvi"><input type="checkbox" value="${esc(v.path)}" ${cvSel.has(v.path)?'checked':''}>🎬 ${esc(v.rel)}</label>`).join(''):'<div class="st" style="padding:8px">Nimic găsit</div>'}
+$('#cvres').addEventListener('change',e=>{if(e.target.checked)cvSel.add(e.target.value);else cvSel.delete(e.target.value);
+ $('#ssel').textContent=cvSel.size?cvSel.size+' film(e) din CineVerse selectate':''});
+async function cvVideoPick(id){const q=prompt('Caută filmul / episodul din CineVerse:');if(!q)return;
+ const d=await (await fetch('cv/videos?q='+encodeURIComponent(q))).json();
+ if(!d.length)return alert('Nimic găsit');
+ const s=document.getElementById('cvv_'+id);s.innerHTML=d.map(v=>`<option value="${esc(v.path)}">${esc(v.rel)}</option>`).join('');s.hidden=false;
+ document.getElementById('cvb_'+id).hidden=false}
+async function cvSend(id,kind){const fd=new FormData();
+ if(kind==='sub'){const s=document.getElementById('cvv_'+id);if(!s.value)return;fd.append('video',s.value)}
+ else{fd.append('dir',document.getElementById('cvd_'+id).value);fd.append('sub',document.getElementById('cvs_'+id).value)}
+ const r=await fetch('cv/send/'+id,{method:'POST',body:fd});const d=await r.json().catch(()=>({}));
+ if(!r.ok||!d.ok)return alert(d.error||'Eroare');last='';load()}
+const cvDone=j=>j.cv?`<div class="ok">✅ În CineVerse: ${esc(j.cv)}</div>`:'';
+
+$('#sgo').onclick=async()=>{
+ if(cvSel.size&&!sfiles.length){const fd=new FormData();[...cvSel].forEach(p=>fd.append('paths',p));
+  fd.append('wmodel',$('#wm').value);fd.append('lang',$('#wl').value);fd.append('task',$('#wt').value);
+  await fetch('subcv',{method:'POST',body:fd});cvSel.clear();$('#cvres').innerHTML='';$('#cvq').value='';$('#ssel').textContent='';last='';return load()}
+ if(!sfiles.length)return alert('Alege fișiere sau un film din CineVerse!');
  try{localStorage.setItem('wopt',JSON.stringify({wm:$('#wm').value,wl:$('#wl').value,wt:$('#wt').value}))}catch(e){}
  const fd=new FormData();sfiles.forEach(f=>fd.append('files',f));
  fd.append('wmodel',$('#wm').value);fd.append('lang',$('#wl').value);fd.append('task',$('#wt').value);
@@ -684,7 +841,9 @@ $('#mode').onchange=syncMode;syncMode();
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 // ---------- tonalitate / tempo ----------
 const NT=['C','C#','D','Eb','E','F','F#','G','Ab','A','Bb','B'],RO=['Do','Do#','Re','Mi♭','Mi','Fa','Fa#','Sol','La♭','La','Si♭','Si'];
-const TL={vocals:'🎤 Voce',instrumental:'🎵 Instrumental',original:'🎧 Original'};
+const TL={vocals:'🎤 Voce',instrumental:'🎵 Instrumental',original:'🎧 Original',drums:'🥁 Tobe',bass:'🎸 Bas',other:'🎹 Altele (pian, chitară, synth…)'};
+const TRK=j=>j.mode==='ana'?['original']:j.mode==='sep4'?['vocals','instrumental','drums','bass','other']:['vocals','instrumental'];
+const TN={vocals:'Voce',instrumental:'Instrumental',original:'Original',drums:'Tobe',bass:'Bas',other:'Altele'};
 const kn=(k,m,s=0)=>{const i=((k+s)%12+12)%12;return NT[i]+(m==='minor'?'m':'')+' · '+RO[i]+' '+m};
 const ks=(k,m,s=0)=>{const i=((k+s)%12+12)%12;return NT[i]+(m==='minor'?'m':'')};
 const ctl={},byId={};
@@ -693,7 +852,7 @@ const sgn=n=>(n>0?'+':'')+n;
 function vSemi(j){const c=C(j);return sgn(c.semi)+' st'+(j.key!=null?' → '+ks(j.key,j.kmode,c.semi):'')}
 function vTempo(j){const c=C(j);return c.tempo+'%'+(j.bpm?' → '+Math.round(j.bpm*c.tempo/100)+' BPM':'')}
 function fx(j){const c=C(j);
- const tr=j.mode==='ana'?[['original','Original']]:[['instrumental','Instrumental'],['vocals','Voce'],['both','Ambele']];
+ const tr=j.mode==='ana'?[['original','Original']]:[['instrumental','Instrumental'],['vocals','Voce'],['both','Voce + Instrumental'],...TRK(j).slice(2).map(k=>[k,TN[k]])];
  let ana='';
  if(j.ana==='done')ana=`<div class="ana"><span>🎼 Tonalitate: <b>${kn(j.key,j.kmode)}</b></span><span>🥁 Tempo: <b>${j.bpm} BPM</b></span></div>`;
  else if(j.ana==='error')ana=`<div class="ana"><span>⚠ Analiza tonalității a eșuat (poți transpune oricum)</span></div>`;
@@ -723,25 +882,30 @@ const LN={ro:'Română',en:'English',it:'Italiano',es:'Español',fr:'Français',
 function subCard(j){
  const stg=j.stage==='model'?'⬇️ Pregătesc modelul Whisper (prima dată se descarcă)…':j.stage==='run'?'⚙️ Transcriere '+j.progress+'%':'⏳ Pornire…';
  const st={queued:'⏳ În așteptare'+(j.queue_pos?' (#'+j.queue_pos+')':''),processing:stg,done:'✅ Gata',error:'❌ Eroare'}[j.status];
- const meta=j.wmodel+' · '+(j.task==='translate'?'→ English':(j.lang==='auto'?'auto':LN[j.lang]||j.lang));
+ const meta=(j.cvsrc?'CineVerse · ':'')+j.wmodel+' · '+(j.task==='translate'?'→ English':(j.lang==='auto'?'auto':LN[j.lang]||j.lang));
  let body='';
  if(j.status==='processing'||j.status==='queued')body=`<div class="bar"><i style="width:${j.progress}%"></i></div>`;
  if(j.status==='done')body=`<div class="ana"><span>🌐 Limbă: <b>${esc(LN[j.dlang]||j.dlang||'?')}</b></span><span>💬 ${j.segs||0} replici</span></div>
   <div class="res one"><div style="display:flex;gap:14px;flex-wrap:wrap">${['srt','vtt','txt'].map(k=>`<a class="d" href="dl/${j.id}/${k}">⬇ ${k.toUpperCase()}</a>`).join('')}
-  <a class="d" style="color:var(--mu)" href="dl/${j.id}/srt?play=1" target="_blank">👁 Vezi SRT</a></div></div>`;
+  <a class="d" style="color:var(--mu)" href="dl/${j.id}/srt?play=1" target="_blank">👁 Vezi SRT</a></div></div>`
+  +(j.cv?cvDone(j):CV.enabled?`<div class="cvbox"><button onclick="cvVideoPick('${j.id}')">📺 Trimite în CineVerse</button>
+   <select id="cvv_${j.id}" hidden></select><button class="p" id="cvb_${j.id}" hidden onclick="cvSend('${j.id}','sub')">Pune subtitrarea lângă film</button></div>`:'')
+  +(j.cverr?`<div class="err">CineVerse: ${esc(j.cverr)}</div>`:'');
  if(j.status==='error')body=`<div class="err">${esc(j.error)}</div>`;
  return `<div class="job"><div class="top"><div class="nm">📝 ${esc(j.name)}</div>
   <div><span class="st">${st} · ${esc(meta)}</span><button class="x" title="Șterge" onclick="del('${j.id}')">✕</button></div></div>${body}</div>`}
 
 function card(j){if(j.type==='sub')return subCard(j);const yt=j.type==='yt';
  const st={queued:'⏳ În așteptare'+(j.queue_pos?' (#'+j.queue_pos+')':''),processing:'⚙️ '+(yt?'Descărcare ':'Procesare ')+j.progress+'%',done:'✅ Gata',error:'❌ Eroare'}[j.status];
- const meta=yt?(j.fmt==='mp3'?'YouTube · MP3':'YouTube · '+(j.fmt==='best'?'max':j.fmt+'p')):(j.mode==='ana'?'tonalitate/tempo':j.model)+' · '+j.fmt;
+ const meta=yt?(j.fmt==='mp3'?'YouTube · MP3':'YouTube · '+(j.fmt==='best'?'max':j.fmt+'p')):(j.mode==='ana'?'tonalitate/tempo':j.mode==='sep4'?'4 piste · '+j.model:j.model)+' · '+j.fmt;
  let body='';
  if(j.status==='processing'||j.status==='queued')body=`<div class="bar"><i style="width:${j.progress}%"></i></div>`;
  if(j.status==='done'){
   if(yt){const s=`dl/${j.id}/file`;
-   body=`<div class="res one"><div>${j.fmt==='mp3'?`<audio controls preload="none" src="${s}?play=1"></audio>`:`<video controls preload="none" src="${s}?play=1"></video>`}<a class="d" href="${s}">⬇ Descarcă</a></div></div>`}
-  else{const tk=j.mode==='ana'?['original']:['vocals','instrumental'];
+   body=`<div class="res one"><div>${j.fmt==='mp3'?`<audio controls preload="none" src="${s}?play=1"></audio>`:`<video controls preload="none" src="${s}?play=1"></video>`}<a class="d" href="${s}">⬇ Descarcă</a></div></div>`
+   +(j.fmt!=='mp3'?(j.cv?cvDone(j):CV.enabled?`<div class="cvbox"><select id="cvd_${j.id}">${CV.dirs.map(d=>`<option value="${d.i}">📁 ${esc(d.name)}</option>`).join('')}</select>
+   <input id="cvs_${j.id}" placeholder="Subfolder (opțional, ex. YouTube)"><button class="p" onclick="cvSend('${j.id}','yt')">📺 Trimite în CineVerse</button></div>`:''):'')}
+  else{const tk=TRK(j);
    body=`<div class="res${tk.length===1?' one':''}">${tk.map(k=>`<div><b>${TL[k]}</b>
    <audio controls preload="none" src="dl/${j.id}/${k}?play=1"></audio><a class="d" href="dl/${j.id}/${k}">⬇ Descarcă</a></div>`).join('')}</div>`+fx(j)}}
  if(j.status==='error')body=`<div class="err">${esc(j.error)}</div>`;
@@ -784,6 +948,38 @@ cat > /etc/cron.daily/vocal-remover-ytdlp <<EOF
 runuser -u $APPUSER -- $BASE/venv/bin/pip install -q -U "yt-dlp[default]" >/dev/null 2>&1
 EOF
 chmod +x /etc/cron.daily/vocal-remover-ytdlp
+
+echo "==> Integrare CineVerse..."
+CVDB=/var/lib/cineverse/cineverse.db
+if [ -f "$CVDB" ]; then
+  CVDIRS=$(python3 - "$CVDB" <<'PYEOF'
+import sqlite3, re, sys
+c = sqlite3.connect(sys.argv[1], timeout=30)
+r = c.execute("select v from settings where k='media_dirs'").fetchone()
+print("\n".join(d.strip() for d in re.split(r"[\n;]+", (r[0] if r else "")) if d.strip()))
+PYEOF
+)
+  if [ -n "$CVDIRS" ]; then
+    command -v setfacl >/dev/null 2>&1 || apt-get install -y -qq acl >/dev/null
+    CVUSR=$(stat -c %U "$CVDB")
+    python3 -c "import json,sys;json.dump({'dirs':[l for l in sys.stdin.read().splitlines() if l.strip()]},open('$BASE/cineverse.json','w'),indent=1)" <<< "$CVDIRS"
+    while IFS= read -r d; do
+      [ -d "$d" ] || { echo "   ⚠ folder inexistent: $d"; continue; }
+      # vocal-remover poate citi filmele și scrie subtitrări/clipuri; CineVerse poate citi ce adăugăm
+      find "$d" -type d -exec setfacl -m "u:$APPUSER:rwx,d:u:$APPUSER:rwx,d:u:$CVUSR:rwx" {} + 2>/dev/null || true
+      find "$d" -type f -exec setfacl -m "u:$APPUSER:r" {} + 2>/dev/null || true
+      # acces la folderele părinte (ex. /home/user)
+      p="$d"; while [ "$p" != "/" ]; do p=$(dirname "$p"); setfacl -m "u:$APPUSER:x" "$p" 2>/dev/null || true; done
+      echo "   📁 $d"
+    done <<< "$CVDIRS"
+  else
+    echo "   CineVerse găsit, dar fără foldere media configurate"; echo '{"dirs":[]}' > "$BASE/cineverse.json"
+  fi
+else
+  echo "   CineVerse nu e instalat pe acest server (opțiunea „Trimite în CineVerse” rămâne ascunsă)"
+  echo '{"dirs":[]}' > "$BASE/cineverse.json"
+fi
+chown "$APPUSER":"$APPUSER" "$BASE/cineverse.json"
 
 echo "==> Serviciu systemd..."
 cat > /etc/systemd/system/vocal-remover.service <<EOF
