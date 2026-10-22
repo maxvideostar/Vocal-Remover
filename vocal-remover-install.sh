@@ -93,6 +93,7 @@ cat > "$BASE/transcribe.py" <<'PYEOF'
 # Ieșire pe stdout: "STAGE x", "LANG xx", "P nn", "DONE {...}"
 import sys, os, re, json, textwrap
 src, out, model, lang, task = sys.argv[1:6]
+use_emb = (sys.argv[6] if len(sys.argv) > 6 else "1") == "1"
 B = "/opt/vocal-remover"
 os.environ.setdefault("HF_HOME", f"{B}/hf")
 P = lambda n: print(f"P {max(0, min(99, int(n)))}", flush=True)
@@ -120,14 +121,71 @@ def read_subs(path):
                 break
     return items
 
+EN_W = re.compile(r"\b(the|you|and|is|to|it|that|what|this|i|i'm|don't|are|of|in|we|have)\b", re.I)
+
+def find_emb(path):
+    """Caută în fișierul video o subtitrare text (RO sau EN). Întoarce (index, limbă) sau None."""
+    import subprocess
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "s", "-show_entries",
+                        "stream=index,codec_name:stream_tags=language,title:stream_disposition=forced,hearing_impaired",
+                        "-of", "json", path], capture_output=True, text=True)
+    try: streams = json.loads(r.stdout).get("streams", [])
+    except Exception: return []
+    TEXT = {"subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text"}
+    cands = []
+    for st in streams:
+        if st.get("codec_name") not in TEXT: continue          # PGS / VobSub sunt imagini -> nu se pot citi
+        tg = {k.lower(): v for k, v in (st.get("tags") or {}).items()}
+        lg, title = (tg.get("language") or "und").lower(), (tg.get("title") or "").lower()
+        if lg in ("rum", "ron", "ro") or "rom" in title: code, sc = "ro", 30
+        elif lg in ("eng", "en") or "english" in title: code, sc = "en", 20
+        elif lg in ("und", ""): code, sc = "en?", 10                 # fără etichetă: verificăm textul
+        else: continue
+        d = st.get("disposition") or {}
+        if d.get("forced") or "forced" in title: sc -= 25           # doar câteva replici
+        if d.get("hearing_impaired") or "sdh" in title: sc -= 1
+        cands.append((sc, st["index"], code))
+    return sorted(cands, reverse=True)
+
+def extract_emb(path, idx):
+    import subprocess
+    tmp = f"{out}/_emb.srt"
+    r = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", path,
+                        "-map", f"0:{idx}", "-f", "srt", tmp], capture_output=True)
+    if r.returncode != 0 or not os.path.exists(tmp): return []
+    its = read_subs(tmp); os.remove(tmp)
+    clean = []
+    for a, b, t in its:
+        t = re.sub(r"\[[^\]]*\]|♪+", "", t)                       # [MUZICĂ], [râde] etc.
+        t = re.sub(r"^[A-Z][A-Z .']+:\s*", "", t.strip()).strip()   # NUME: replică (SDH)
+        if t: clean.append((a, b, t))
+    return clean
+
 is_sub = os.path.splitext(src)[1].lower() in (".srt", ".vtt")
 w_end = 99 if task != "ro" else 70     # cât din bara de progres ia Whisper
+from_text = is_sub
+items = None
+
+if not is_sub and use_emb and task == "ro":
+    print("STAGE emb", flush=True)
+    for sc, idx, code in find_emb(src):
+        its = extract_emb(src, idx)
+        if len(its) < 20: continue                                   # prea puține replici (forced / gol)
+        if code == "en?":
+            words = " ".join(t for _, _, t in its[:300]).split()
+            if not words or len(EN_W.findall(" ".join(words))) / len(words) < 0.06: continue
+            code = "en"
+        items, src_lang, from_text = its, code, True
+        print(f"SRC emb:{code}", flush=True)
+        break
 
 if is_sub:
     print("STAGE run", flush=True)
     items = read_subs(src)
     src_lang = "en"
-else:
+    print("SRC file", flush=True)
+elif items is None:
+    print("SRC audio", flush=True)
     import subprocess, numpy as np
     from faster_whisper import WhisperModel
     print("STAGE model", flush=True)
@@ -172,7 +230,7 @@ if task == "ro" and src_lang != "ro" and items:
             last = e; tok = None
     if tok is None: raise SystemExit(f"Error: nu pot încărca modelul de traducere: {last}")
     texts = [t for _, _, t in items]; res = []; bs = 16
-    start = 0 if is_sub else w_end
+    start = 0 if from_text else w_end
     for n in range(0, len(texts), bs):
         batch = texts[n:n + bs]
         enc = tok(batch, return_tensors="pt", padding=True, truncation=True, max_length=256)
@@ -367,7 +425,8 @@ def sub_worker():
         od = os.path.join(OUT, jid); os.makedirs(od, exist_ok=True)
         try:
             with heavy:
-                p = subprocess.Popen([PY, f"{BASE}/transcribe.py", j["path"], od, j["wmodel"], j["lang"], j["task"]],
+                p = subprocess.Popen([PY, f"{BASE}/transcribe.py", j["path"], od, j["wmodel"], j["lang"], j["task"],
+                                      "1" if j.get("emb", True) else "0"],
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
                                      errors="replace")
                 log = []
@@ -377,6 +436,7 @@ def sub_worker():
                     elif line.startswith("LANG "): j["dlang"] = line[5:]
                     elif line.startswith("P "): j["progress"] = int(line[2:])
                     elif line.startswith("DONE "): j["segs"] = json.loads(line[5:])["segs"]
+                    elif line.startswith("SRC "): j["srcinfo"] = line[4:]
                 p.wait()
             if p.returncode != 0 or not os.path.exists(f"{od}/sub.srt"):
                 err = [l for l in log if "Error" in l or "error" in l]
@@ -695,7 +755,7 @@ def subupload():
         nm = os.path.splitext(f.filename)[0]
         if is_sub: nm = re.sub(r"[._-](en|eng|english)$", "", nm, flags=re.I)
         jid = new_job(type="sub", name=nm, path="", wmodel="—" if is_sub else wm, lang=lang,
-                      task="ro" if is_sub else task)
+                      task="ro" if is_sub else task, emb=request.form.get("emb", "1") == "1")
         path = os.path.join(UP, jid + ext); f.save(path)
         jobs[jid]["path"] = path
         wq.put(jid); ids.append(jid)
@@ -743,7 +803,7 @@ def subcv():
             errs.append(f"{nm}: fără drept de citire (rulează din nou installer-ul)")
         else:
             jid = new_job(type="sub", name=os.path.splitext(nm)[0], path=pth, cvsrc=True,
-                          wmodel=wm, lang=lang, task=task)
+                          wmodel=wm, lang=lang, task=task, emb=request.form.get("emb", "1") == "1")
             wq.put(jid); ids.append(jid)
     for e in errs: print("subtitrare CineVerse:", e, flush=True)
     if not paths: errs.append("Niciun film selectat")
@@ -805,7 +865,7 @@ def jobs_json(kind):
     pos = {jid: i + 1 for qq in (sq, yq, wq) for i, jid in enumerate(list(qq.queue))}
     for i, t in enumerate([t for t in list(fxq.queue) if t[0] == "conv"]): pos[t[1]] = i + 1
     keys = ("id", "type", "mode", "name", "model", "fmt", "status", "progress", "error", "ext",
-            "ana", "key", "kmode", "bpm", "shifts", "wmodel", "lang", "task", "dlang", "segs", "stage", "cv", "cvsrc", "cverr")
+            "ana", "key", "kmode", "bpm", "shifts", "wmodel", "lang", "task", "dlang", "segs", "stage", "cv", "cvsrc", "cverr", "srcinfo")
     with lock: js = sorted(jobs.values(), key=lambda x: -x["created"])
     js = [j for j in js if (j.get("type") == "sub") == (kind == "sub")]
     return jsonify([{**{k: j.get(k) for k in keys}, "queue_pos": pos.get(j["id"], 0)} for j in js])
@@ -1121,6 +1181,7 @@ SUBHTML = r"""<!doctype html><html lang="ro"><head><meta charset="utf-8">
 <div class="row"><select id="wm">%WMODELS%</select><select id="wl">%WLANGS%</select>
 <select id="wt"><option value="ro">🇷🇴 Traducere în română</option><option value="transcribe">Transcriere (aceeași limbă)</option><option value="translate">🇬🇧 Traducere în engleză</option></select>
 <button class="p" id="sgo">Generează</button></div>
+<label class="chk" id="embl" style="margin:-4px 0 12px"><input type="checkbox" id="emb" checked> 📄 Folosește subtitrarea din film (EN/RO) dacă există – mult mai rapid și mai exact decât din audio</label>
 <div id="ssel" class="sub"></div>
 <div id="list"></div></div>
 <script>
@@ -1152,7 +1213,10 @@ async function cvSend(id){const s=document.getElementById('cvv_'+id);if(!s.value
  const fd=new FormData();fd.append('video',s.value);
  const r=await api('send/'+id,{method:'POST',body:fd});const d=await r.json().catch(()=>({}));
  if(!r.ok||!d.ok)return alert(d.error||'Eroare');last='';load()}
+const syncEmb=()=>{const ro=$('#wt').value==='ro';$('#emb').disabled=!ro;$('#embl').style.opacity=ro?1:.4};
+$('#wt').addEventListener('change',syncEmb);setTimeout(syncEmb,0);
 const opts=fd=>{fd.append('wmodel',$('#wm').value);fd.append('lang',$('#wl').value);fd.append('task',$('#wt').value);
+ fd.append('emb',$('#emb').checked?'1':'0');
  try{localStorage.setItem('wopt',JSON.stringify({wm:$('#wm').value,wl:$('#wl').value,wt:$('#wt').value}))}catch(e){}};
 $('#sgo').onclick=async()=>{
  if(cvSel.size&&!sfiles.length){const fd=new FormData();[...cvSel].forEach(p=>fd.append('paths',p));opts(fd);
@@ -1172,12 +1236,12 @@ $('#sgo').onclick=async()=>{
  x.onload=()=>{if(x.status===401)return location.href='login';sfiles=[];sinp.value='';$('#ssel').textContent='';last='';load()};x.send(fd)};
 const LN={ro:'Română',en:'English',it:'Italiano',es:'Español',fr:'Français',de:'Deutsch',hu:'Magyar',ru:'Русский',tr:'Türkçe'};
 function card(j){
- const stg=j.stage==='model'?'⬇️ Pregătesc modelul Whisper (prima dată se descarcă)…':j.stage==='audio'?'🎧 Extrag sunetul…':j.stage==='run'?'⚙️ Transcriere '+j.progress+'%':j.stage==='tr'?'🇷🇴 Traducere în română '+j.progress+'%':'⏳ Pornire…';
+ const stg=j.stage==='model'?'⬇️ Pregătesc modelul Whisper (prima dată se descarcă)…':j.stage==='audio'?'🎧 Extrag sunetul…':j.stage==='emb'?'📄 Caut subtitrări în film…':j.stage==='run'?'⚙️ Transcriere '+j.progress+'%':j.stage==='tr'?'🇷🇴 Traducere în română '+j.progress+'%':'⏳ Pornire…';
  const st={queued:'⏳ În așteptare'+(j.queue_pos?' (#'+j.queue_pos+')':''),processing:stg,done:'✅ Gata',error:'❌ Eroare'}[j.status];
  const meta=(j.cvsrc?'CineVerse · ':'')+j.wmodel+' · '+(j.task==='translate'?'→ English':j.task==='ro'?'→ Română':(j.lang==='auto'?'auto':LN[j.lang]||j.lang));
  let body='';
  if(j.status==='processing'||j.status==='queued')body=`<div class="bar"><i style="width:${j.progress}%"></i></div>`;
- if(j.status==='done')body=`<div class="ana"><span>🌐 Limbă: <b>${esc(LN[j.dlang]||j.dlang||'?')}</b></span><span>💬 ${j.segs||0} replici</span></div>
+ if(j.status==='done')body=`<div class="ana"><span>🌐 Limbă: <b>${esc(LN[j.dlang]||j.dlang||'?')}</b></span><span>💬 ${j.segs||0} replici</span>${j.srcinfo?`<span>${j.srcinfo==='emb:en'?'📄 Din subtitrarea EN a filmului':j.srcinfo==='emb:ro'?'📄 Din subtitrarea RO a filmului':j.srcinfo==='file'?'📄 Din fișierul .srt':'🎧 Din audio (Whisper)'}</span>`:''}</div>
   <div class="res one"><div style="display:flex;gap:14px;flex-wrap:wrap">${['srt','vtt','txt'].map(k=>`<a class="d" href="api/dl/${j.id}/${k}">⬇ ${k.toUpperCase()}</a>`).join('')}
   <a class="d" style="color:var(--mu)" href="api/dl/${j.id}/srt?play=1" target="_blank">👁 Vezi SRT</a></div></div>`
   +(j.cv?`<div class="ok">✅ În CineVerse: ${esc(j.cv)}</div>`:CV.enabled?`<div class="cvbox"><button onclick="cvVideoPick('${j.id}')">📺 Trimite în CineVerse</button>

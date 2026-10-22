@@ -32,6 +32,7 @@ Separare **voce / instrumental** cu AI ([Demucs](https://github.com/facebookrese
 - Încarci un film, clip sau fișier audio și primești subtitrarea în **SRT**, **VTT** și **TXT**
 - Detectare automată a limbii, sau alegi tu (română, engleză etc.)
 - **Traducere în română** 🇷🇴: din engleză direct (Opus-MT, offline), din alte limbi prin engleză
+- **Folosește subtitrarea din film**: dacă MKV/MP4 conține o subtitrare text în engleză (sau română), o extrage și o traduce direct, fără Whisper (mult mai rapid și mai exact); sare peste piste „forced” și curăță etichetele SDH ([muzică], NUME:)
 - Poți încărca și o subtitrare **.srt în engleză** și o primești tradusă în română
 - Opțiune **„Traducere în engleză”**
 - 3 modele: `small` (rapid), `medium` (recomandat), `large-v3-turbo` (cel mai precis)
