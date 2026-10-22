@@ -25,6 +25,14 @@ Separare **voce / instrumental** cu AI ([Demucs](https://github.com/facebookrese
 - Se aplică pe Instrumental, Voce sau ambele (pentru voce se păstrează timbrul natural)
 - Mod **„Doar tonalitate/tempo”** pentru melodii pe care vrei doar să le transpui, fără separare
 
+### 📝 Subtitrări AI (Whisper)
+- Încarci un film, clip sau fișier audio și primești subtitrarea în **SRT**, **VTT** și **TXT**
+- Detectare automată a limbii, sau alegi tu (română, engleză etc.)
+- Opțiune **„Traducere în engleză”**
+- 3 modele: `small` (rapid), `medium` (recomandat), `large-v3-turbo` (cel mai precis)
+- Fișierul se numește `Film.ro.srt`, gata de pus lângă film în Jellyfin / Plex
+- Modelul se descarcă automat la prima utilizare (~0.5–1.6 GB)
+
 ### ▶️ YouTube
 - Lipești unul sau mai multe link-uri (unul pe linie)
 - **MP3 320k** cu copertă și metadate, sau **video MP4** la calitate maximă (până la 4K), 1080p, 720p sau 480p
@@ -81,6 +89,7 @@ Fișierele aplicației se află în `/opt/vocal-remover/`:
 ├── uploads/      # fișiere în curs de procesare
 ├── output/       # rezultate (voce + instrumental)
 ├── youtube/      # descărcări YouTube
+├── whisper-models/ # modele Whisper (descărcate la prima utilizare)
 └── jobs.json     # istoric / coadă
 ```
 

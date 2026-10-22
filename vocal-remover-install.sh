@@ -61,6 +61,42 @@ mkdir -p "$BASE"/{uploads,output,youtube}
 "$BASE/venv/bin/pip" install -q torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
 "$BASE/venv/bin/pip" install -q demucs==4.0.1 flask waitress soundfile "librosa>=0.10.2"
 "$BASE/venv/bin/pip" install -q -U "yt-dlp[default]"
+"$BASE/venv/bin/pip" install -q "faster-whisper>=1.1.0"
+
+echo "==> Modul subtitrări (Whisper)..."
+mkdir -p "$BASE/whisper-models"
+cat > "$BASE/transcribe.py" <<'PYEOF'
+# Transcriere / traducere cu faster-whisper -> SRT, VTT, TXT
+# Ieșire pe stdout: "STAGE x", "LANG xx", "P nn"
+import sys, os, json, textwrap
+from faster_whisper import WhisperModel
+src, out, model, lang, task = sys.argv[1:6]
+print("STAGE model", flush=True)
+m = WhisperModel(model, device="cpu", compute_type="int8", cpu_threads=os.cpu_count() or 4,
+                 download_root="/opt/vocal-remover/whisper-models")
+print("STAGE run", flush=True)
+segs, info = m.transcribe(src, language=None if lang == "auto" else lang, task=task,
+                          vad_filter=True, beam_size=5)
+print("LANG " + ("en" if task == "translate" else info.language), flush=True)
+dur = info.duration or 1
+items = []
+for sg in segs:
+    t = sg.text.strip()
+    if t: items.append((sg.start, sg.end, t))
+    print(f"P {min(99, int(sg.end / dur * 100))}", flush=True)
+def ts(x, sep):
+    ms = int(round(x * 1000)); h, ms = divmod(ms, 3600000); m_, ms = divmod(ms, 60000); s_, ms = divmod(ms, 1000)
+    return f"{h:02}:{m_:02}:{s_:02}{sep}{ms:03}"
+wrap = lambda t: "\n".join(textwrap.wrap(t, max(42, len(t) // 2 + 6))) if len(t) > 42 else t
+with open(f"{out}/sub.srt", "w", encoding="utf-8") as f:
+    for i, (a, b, t) in enumerate(items, 1): f.write(f"{i}\n{ts(a, ',')} --> {ts(b, ',')}\n{wrap(t)}\n\n")
+with open(f"{out}/sub.vtt", "w", encoding="utf-8") as f:
+    f.write("WEBVTT\n\n")
+    for a, b, t in items: f.write(f"{ts(a, '.')} --> {ts(b, '.')}\n{wrap(t)}\n\n")
+with open(f"{out}/sub.txt", "w", encoding="utf-8") as f:
+    f.write("\n".join(t for _, _, t in items) + "\n")
+print("DONE " + json.dumps({"segs": len(items)}), flush=True)
+PYEOF
 
 echo "==> Modul analiză tonalitate / tempo..."
 cat > "$BASE/analyze.py" <<'PYEOF'
@@ -113,8 +149,15 @@ try:
 except Exception:
     HAS_RB = False
 
+WMODELS = {"medium": "Mediu (recomandat)",
+           "large-v3-turbo": "Large v3 Turbo (cel mai precis)",
+           "small": "Mic (rapid)"}
+WLANGS = {"auto": "Detectare automată", "ro": "Română", "en": "English", "it": "Italiano", "es": "Español",
+          "fr": "Français", "de": "Deutsch", "hu": "Magyar", "ru": "Русский", "tr": "Türkçe"}
+
 lock = threading.RLock()
-sq, yq, fxq = queue.Queue(), queue.Queue(), queue.Queue()
+heavy = threading.Lock()  # Demucs și Whisper nu rulează simultan (CPU)
+sq, yq, fxq, wq = queue.Queue(), queue.Queue(), queue.Queue(), queue.Queue()
 jobs = {}
 
 def save():
@@ -141,6 +184,10 @@ def load():
             j["progress"] = 0
             if j["type"] == "yt":
                 j["status"] = "queued"; yq.put(jid)
+            elif j["type"] == "sub" and os.path.exists(j.get("path", "")):
+                j["status"] = "queued"; wq.put(jid)
+            elif j["type"] == "sub":
+                j["status"], j["error"] = "error", "Întrerupt la restart"
             elif os.path.exists(j.get("path", "")):
                 j["status"] = "queued"
                 if j["mode"] == "ana": fxq.put(("conv", jid))
@@ -177,7 +224,7 @@ def sep_worker():
         cmd = [PY, "-m", "demucs", "--two-stems=vocals", "-n", j["model"],
                "-o", od, *FMTS[j["fmt"]], j["path"]]
         try:
-            rc, log = run(cmd, j, r"(\d+)%\|")
+            with heavy: rc, log = run(cmd, j, r"(\d+)%\|")
             v = glob.glob(f"{od}/*/*/vocals.*"); n = glob.glob(f"{od}/*/*/no_vocals.*")
             if rc != 0 or not v or not n:
                 raise RuntimeError("".join(log[-5:]) or "Demucs a eșuat")
@@ -188,6 +235,36 @@ def sep_worker():
             j.update(status="done", progress=100, ext=ext, finished=time.time(), ana="queued")
             fxq.put(("ana", jid))
             auto_shift(j)
+        except Exception as e:
+            j.update(status="error", error=str(e)[-400:])
+        finally:
+            try: os.remove(j["path"])
+            except Exception: pass
+            save()
+
+def sub_worker():
+    while True:
+        jid = wq.get(); j = jobs.get(jid)
+        if not j: continue
+        j.update(status="processing", progress=0, stage="queued"); save()
+        od = os.path.join(OUT, jid); os.makedirs(od, exist_ok=True)
+        try:
+            with heavy:
+                p = subprocess.Popen([PY, f"{BASE}/transcribe.py", j["path"], od, j["wmodel"], j["lang"], j["task"]],
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                     errors="replace")
+                log = []
+                for line in p.stdout:
+                    line = line.strip(); log.append(line); log = log[-40:]
+                    if line.startswith("STAGE "): j["stage"] = line[6:]
+                    elif line.startswith("LANG "): j["dlang"] = line[5:]
+                    elif line.startswith("P "): j["progress"] = int(line[2:])
+                    elif line.startswith("DONE "): j["segs"] = json.loads(line[5:])["segs"]
+                p.wait()
+            if p.returncode != 0 or not os.path.exists(f"{od}/sub.srt"):
+                err = [l for l in log if "Error" in l or "error" in l]
+                raise RuntimeError("\n".join(err[-3:] or log[-6:]) or "Whisper a eșuat")
+            j.update(status="done", progress=100, finished=time.time())
         except Exception as e:
             j.update(status="error", error=str(e)[-400:])
         finally:
@@ -335,7 +412,8 @@ def fx_worker():
 @app.route("/")
 def index():
     o = lambda d: "".join(f'<option value="{k}">{v}</option>' for k, v in d.items())
-    return Response(HTML.replace("%MODELS%", o(MODELS)).replace("%YTFMTS%", o(YT_FMTS)),
+    return Response(HTML.replace("%MODELS%", o(MODELS)).replace("%YTFMTS%", o(YT_FMTS))
+                    .replace("%WMODELS%", o(WMODELS)).replace("%WLANGS%", o(WLANGS)),
                     mimetype="text/html")
 
 @app.route("/upload", methods=["POST"])
@@ -366,6 +444,22 @@ def upload():
     save()
     return jsonify(ids)
 
+@app.route("/subupload", methods=["POST"])
+def subupload():
+    wm, lang = request.form.get("wmodel", "medium"), request.form.get("lang", "auto")
+    task = request.form.get("task", "transcribe")
+    if wm not in WMODELS or lang not in WLANGS or task not in ("transcribe", "translate"): abort(400)
+    ids = []
+    for f in request.files.getlist("files"):
+        if not f.filename: continue
+        ext = os.path.splitext(f.filename)[1].lower() or ".bin"
+        jid = new_job(type="sub", name=os.path.splitext(f.filename)[0], path="", wmodel=wm, lang=lang, task=task)
+        path = os.path.join(UP, jid + ext); f.save(path)
+        jobs[jid]["path"] = path
+        wq.put(jid); ids.append(jid)
+    save()
+    return jsonify(ids)
+
 @app.route("/yt", methods=["POST"])
 def yt():
     fmt = request.form.get("fmt", "mp3")
@@ -382,10 +476,10 @@ def yt():
 
 @app.route("/jobs")
 def list_jobs():
-    pos = {jid: i + 1 for qq in (sq, yq) for i, jid in enumerate(list(qq.queue))}
+    pos = {jid: i + 1 for qq in (sq, yq, wq) for i, jid in enumerate(list(qq.queue))}
     for i, t in enumerate([t for t in list(fxq.queue) if t[0] == "conv"]): pos[t[1]] = i + 1
     keys = ("id", "type", "mode", "name", "model", "fmt", "status", "progress", "error", "ext",
-            "ana", "key", "kmode", "bpm", "shifts")
+            "ana", "key", "kmode", "bpm", "shifts", "wmodel", "lang", "task", "dlang", "segs", "stage")
     with lock: js = sorted(jobs.values(), key=lambda x: -x["created"])
     return jsonify([{**{k: j.get(k) for k in keys}, "queue_pos": pos.get(j["id"], 0)} for j in js])
 
@@ -398,6 +492,13 @@ def dl(jid, kind):
         if kind != "file" or not os.path.exists(j.get("file", "")): abort(404)
         return send_file(j["file"], as_attachment=not play,
                          download_name=f"{j['name']}.{j['ext']}", conditional=True)
+    if j.get("type") == "sub":
+        if kind not in ("srt", "vtt", "txt"): abort(404)
+        f = f"{OUT}/{jid}/sub.{kind}"
+        if not os.path.exists(f): abort(404)
+        lg = j.get("dlang") or "und"
+        return send_file(f, as_attachment=not play, mimetype="text/plain; charset=utf-8",
+                         download_name=f"{j['name']}.{lg}.{kind}" if kind != "txt" else f"{j['name']}.{lg}.txt")
     if kind.startswith("s_"):
         s = next((x for x in j.get("shifts", []) if x["id"] == kind[2:]), None)
         if not s or s["status"] != "done": abort(404)
@@ -484,8 +585,8 @@ a.d{color:var(--ok);font-size:13px;text-decoration:none}
 .sh{display:flex;flex-direction:column;gap:4px;margin-top:8px;background:var(--bg);border-radius:10px;padding:10px}
 .sh .top{flex-direction:row!important;align-items:center}.sh .top b{font-size:13px}
 </style></head><body><div class="w">
-<h1>🎤 Vocal Remover</h1><div class="sub">Separare voce / instrumental cu AI (Demucs) · Descărcare YouTube</div>
-<div class="tabs"><button class="t on" data-t="sep">🎤 Separare voce</button><button class="t" data-t="yt">▶️ YouTube</button></div>
+<h1>🎤 Vocal Remover</h1><div class="sub">Separare voce · Tonalitate & tempo · Subtitrări AI · YouTube</div>
+<div class="tabs"><button class="t on" data-t="sep">🎤 Separare voce</button><button class="t" data-t="yt">▶️ YouTube</button><button class="t" data-t="sub">📝 Subtitrări</button></div>
 
 <section id="sep">
 <div class="drop" id="drop">📂 Trage fișiere aici sau apasă pentru a alege<br>
@@ -505,6 +606,16 @@ a.d{color:var(--ok);font-size:13px;text-decoration:none}
 <div id="sel" class="sub"></div>
 </section>
 
+<section id="sub" hidden>
+<div class="drop" id="sdrop">📝 Trage aici filme, clipuri sau audio pentru subtitrare<br>
+<small style="color:var(--mu)">MP4, MKV, AVI, MP3, WAV… · rezultat SRT / VTT / TXT</small>
+<input type="file" id="sf" multiple accept="audio/*,video/*,.mkv,.avi,.ts" hidden></div>
+<div class="row"><select id="wm">%WMODELS%</select><select id="wl">%WLANGS%</select>
+<select id="wt"><option value="transcribe">Transcriere (aceeași limbă)</option><option value="translate">Traducere în engleză</option></select>
+<button class="p" id="sgo">Generează</button></div>
+<div id="ssel" class="sub"></div>
+</section>
+
 <section id="yt" hidden>
 <textarea id="urls" placeholder="Lipește link-uri YouTube (unul pe linie)&#10;https://www.youtube.com/watch?v=..."></textarea>
 <div class="row"><select id="yfmt">%YTFMTS%</select>
@@ -516,7 +627,7 @@ a.d{color:var(--ok);font-size:13px;text-decoration:none}
 <script>
 const $=s=>document.querySelector(s);let files=[];
 function tab(t){document.querySelectorAll('.t').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
- $('#sep').hidden=t!=='sep';$('#yt').hidden=t!=='yt';try{localStorage.setItem('tab',t)}catch(e){}}
+ $('#sep').hidden=t!=='sep';$('#yt').hidden=t!=='yt';$('#sub').hidden=t!=='sub';try{localStorage.setItem('tab',t)}catch(e){}}
 document.querySelectorAll('.t').forEach(b=>b.onclick=()=>tab(b.dataset.t));
 let t0='sep';try{t0=localStorage.getItem('tab')||'sep'}catch(e){};tab(t0);
 
@@ -534,6 +645,23 @@ $('#go').onclick=()=>{if(!files.length)return alert('Alege fișiere!');
  const x=new XMLHttpRequest();x.open('POST','upload');
  x.upload.onprogress=e=>$('#sel').textContent='Încărcare: '+Math.round(e.loaded/e.total*100)+'%';
  x.onload=()=>{files=[];inp.value='';$('#sel').textContent='';load()};x.send(fd)};
+
+// ---------- subtitrări ----------
+let sfiles=[];const sdrop=$('#sdrop'),sinp=$('#sf');
+sdrop.onclick=()=>sinp.click();
+const sShow=()=>{$('#ssel').textContent=sfiles.length?sfiles.length+' fișier(e): '+sfiles.map(f=>f.name).join(', '):''};
+sinp.onchange=()=>{sfiles=[...sinp.files];sShow()};
+['dragover','dragenter'].forEach(e=>sdrop.addEventListener(e,ev=>{ev.preventDefault();sdrop.classList.add('on')}));
+['dragleave','drop'].forEach(e=>sdrop.addEventListener(e,ev=>{ev.preventDefault();sdrop.classList.remove('on')}));
+sdrop.addEventListener('drop',ev=>{sfiles=[...ev.dataTransfer.files];sShow()});
+try{const v=JSON.parse(localStorage.getItem('wopt')||'{}');for(const k of ['wm','wl','wt'])if(v[k])$('#'+k).value=v[k]}catch(e){}
+$('#sgo').onclick=()=>{if(!sfiles.length)return alert('Alege fișiere!');
+ try{localStorage.setItem('wopt',JSON.stringify({wm:$('#wm').value,wl:$('#wl').value,wt:$('#wt').value}))}catch(e){}
+ const fd=new FormData();sfiles.forEach(f=>fd.append('files',f));
+ fd.append('wmodel',$('#wm').value);fd.append('lang',$('#wl').value);fd.append('task',$('#wt').value);
+ const x=new XMLHttpRequest();x.open('POST','subupload');
+ x.upload.onprogress=e=>$('#ssel').textContent='Încărcare: '+Math.round(e.loaded/e.total*100)+'%';
+ x.onload=()=>{sfiles=[];sinp.value='';$('#ssel').textContent='';last='';load()};x.send(fd)};
 
 const syncSep=()=>{const mp3=$('#yfmt').value==='mp3';$('#ysep').disabled=!mp3;if(!mp3)$('#ysep').checked=false;
  $('#ysep').parentElement.style.opacity=mp3?1:.4};
@@ -591,7 +719,21 @@ async function applyFx(id){const c=C(byId[id]);if(!c.semi&&c.tempo===100)return 
  const r=await fetch('shift/'+id,{method:'POST',body:fd});if(!r.ok)return alert('Eroare server');last='';load()}
 async function delShift(id,sid){await fetch('delshift/'+id+'/'+sid,{method:'POST'});last='';load()}
 
-function card(j){const yt=j.type==='yt';
+const LN={ro:'Română',en:'English',it:'Italiano',es:'Español',fr:'Français',de:'Deutsch',hu:'Magyar',ru:'Русский',tr:'Türkçe'};
+function subCard(j){
+ const stg=j.stage==='model'?'⬇️ Pregătesc modelul Whisper (prima dată se descarcă)…':j.stage==='run'?'⚙️ Transcriere '+j.progress+'%':'⏳ Pornire…';
+ const st={queued:'⏳ În așteptare'+(j.queue_pos?' (#'+j.queue_pos+')':''),processing:stg,done:'✅ Gata',error:'❌ Eroare'}[j.status];
+ const meta=j.wmodel+' · '+(j.task==='translate'?'→ English':(j.lang==='auto'?'auto':LN[j.lang]||j.lang));
+ let body='';
+ if(j.status==='processing'||j.status==='queued')body=`<div class="bar"><i style="width:${j.progress}%"></i></div>`;
+ if(j.status==='done')body=`<div class="ana"><span>🌐 Limbă: <b>${esc(LN[j.dlang]||j.dlang||'?')}</b></span><span>💬 ${j.segs||0} replici</span></div>
+  <div class="res one"><div style="display:flex;gap:14px;flex-wrap:wrap">${['srt','vtt','txt'].map(k=>`<a class="d" href="dl/${j.id}/${k}">⬇ ${k.toUpperCase()}</a>`).join('')}
+  <a class="d" style="color:var(--mu)" href="dl/${j.id}/srt?play=1" target="_blank">👁 Vezi SRT</a></div></div>`;
+ if(j.status==='error')body=`<div class="err">${esc(j.error)}</div>`;
+ return `<div class="job"><div class="top"><div class="nm">📝 ${esc(j.name)}</div>
+  <div><span class="st">${st} · ${esc(meta)}</span><button class="x" title="Șterge" onclick="del('${j.id}')">✕</button></div></div>${body}</div>`}
+
+function card(j){if(j.type==='sub')return subCard(j);const yt=j.type==='yt';
  const st={queued:'⏳ În așteptare'+(j.queue_pos?' (#'+j.queue_pos+')':''),processing:'⚙️ '+(yt?'Descărcare ':'Procesare ')+j.progress+'%',done:'✅ Gata',error:'❌ Eroare'}[j.status];
  const meta=yt?(j.fmt==='mp3'?'YouTube · MP3':'YouTube · '+(j.fmt==='best'?'max':j.fmt+'p')):(j.mode==='ana'?'tonalitate/tempo':j.model)+' · '+j.fmt;
  let body='';
@@ -620,6 +762,7 @@ load()
 threading.Thread(target=sep_worker, daemon=True).start()
 threading.Thread(target=yt_worker, daemon=True).start()
 threading.Thread(target=fx_worker, daemon=True).start()
+threading.Thread(target=sub_worker, daemon=True).start()
 
 if __name__ == "__main__":
     from waitress import serve
@@ -645,7 +788,7 @@ chmod +x /etc/cron.daily/vocal-remover-ytdlp
 echo "==> Serviciu systemd..."
 cat > /etc/systemd/system/vocal-remover.service <<EOF
 [Unit]
-Description=Vocal Remover (Demucs + YouTube Web UI)
+Description=Vocal Remover (Demucs + Whisper + YouTube Web UI)
 After=network.target
 
 [Service]
