@@ -448,8 +448,14 @@ def cv_dirs():
     except Exception: return []
 
 def cv_inside(path):
-    rp = os.path.realpath(path)
-    return any(rp == os.path.realpath(d) or rp.startswith(os.path.realpath(d) + os.sep) for d in cv_dirs())
+    # verificăm calea așa cum apare în bibliotecă (fără a urmări symlink-urile:
+    # biblioteca poate conține link-uri către fișiere aflate în alt folder)
+    if not path or not os.path.isabs(path): return False
+    np = os.path.normpath(path)
+    for d in cv_dirs():
+        for root in {os.path.normpath(d), os.path.realpath(d)}:
+            if np == root or np.startswith(root.rstrip(os.sep) + os.sep): return True
+    return False
 
 def cv_files():
     if time.time() - _cvcache["t"] < 120: return _cvcache["files"]
