@@ -31,6 +31,8 @@ Separare **voce / instrumental** cu AI ([Demucs](https://github.com/facebookrese
 - Parola se setează la instalare și se schimbă oricând cu `sudo subtitrari-parola`
 - Încarci un film, clip sau fișier audio și primești subtitrarea în **SRT**, **VTT** și **TXT**
 - Detectare automată a limbii, sau alegi tu (română, engleză etc.)
+- **Traducere în română** 🇷🇴: din engleză direct (Opus-MT, offline), din alte limbi prin engleză
+- Poți încărca și o subtitrare **.srt în engleză** și o primești tradusă în română
 - Opțiune **„Traducere în engleză”**
 - 3 modele: `small` (rapid), `medium` (recomandat), `large-v3-turbo` (cel mai precis)
 - Fișierul se numește `Film.ro.srt`, gata de pus lângă film în Jellyfin / Plex

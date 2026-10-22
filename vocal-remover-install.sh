@@ -81,29 +81,101 @@ mkdir -p "$BASE"/{uploads,output,youtube}
 "$BASE/venv/bin/pip" install -q torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
 "$BASE/venv/bin/pip" install -q demucs==4.0.1 flask waitress soundfile "librosa>=0.10.2"
 "$BASE/venv/bin/pip" install -q -U "yt-dlp[default]"
-"$BASE/venv/bin/pip" install -q "faster-whisper>=1.1.0"
+"$BASE/venv/bin/pip" install -q "faster-whisper>=1.1.0" "transformers>=4.44,<4.50" sentencepiece sacremoses
 
 echo "==> Modul subtitrări (Whisper)..."
 mkdir -p "$BASE/whisper-models"
 cat > "$BASE/transcribe.py" <<'PYEOF'
-# Transcriere / traducere cu faster-whisper -> SRT, VTT, TXT
-# Ieșire pe stdout: "STAGE x", "LANG xx", "P nn"
-import sys, os, json, textwrap
-from faster_whisper import WhisperModel
+# Transcriere / traducere cu faster-whisper (+ traducere EN->RO cu Opus-MT) -> SRT, VTT, TXT
+# task: transcribe | translate (-> engleză) | ro (-> română)
+# Sursa poate fi audio/video sau direct un fișier .srt/.vtt (doar traducere)
+# Ieșire pe stdout: "STAGE x", "LANG xx", "P nn", "DONE {...}"
+import sys, os, re, json, textwrap
 src, out, model, lang, task = sys.argv[1:6]
-print("STAGE model", flush=True)
-m = WhisperModel(model, device="cpu", compute_type="int8", cpu_threads=os.cpu_count() or 4,
-                 download_root="/opt/vocal-remover/whisper-models")
-print("STAGE run", flush=True)
-segs, info = m.transcribe(src, language=None if lang == "auto" else lang, task=task,
-                          vad_filter=True, beam_size=5)
-print("LANG " + ("en" if task == "translate" else info.language), flush=True)
-dur = info.duration or 1
-items = []
-for sg in segs:
-    t = sg.text.strip()
-    if t: items.append((sg.start, sg.end, t))
-    print(f"P {min(99, int(sg.end / dur * 100))}", flush=True)
+B = "/opt/vocal-remover"
+os.environ.setdefault("HF_HOME", f"{B}/hf")
+P = lambda n: print(f"P {max(0, min(99, int(n)))}", flush=True)
+
+def read_subs(path):
+    raw = open(path, "rb").read()
+    for enc in ("utf-8-sig", "cp1250", "latin-1"):
+        try: txt = raw.decode(enc); break
+        except UnicodeDecodeError: pass
+    txt = txt.replace("\r\n", "\n").replace("\r", "\n")
+    def sec(t):
+        t = t.replace(",", ".").strip().split()[0]
+        parts = t.split(":")
+        if len(parts) == 2: parts = ["0"] + parts
+        h, m_, s_ = parts
+        return int(h) * 3600 + int(m_) * 60 + float(s_)
+    items = []
+    for blk in re.split(r"\n\s*\n", txt):
+        lines = [l for l in blk.strip().split("\n") if l.strip()]
+        for n, l in enumerate(lines):
+            if "-->" in l:
+                a, b = l.split("-->")
+                t = " ".join(re.sub(r"<[^>]+>|\{[^}]+\}", "", x).strip() for x in lines[n + 1:]).strip()
+                if t: items.append((sec(a), sec(b), t))
+                break
+    return items
+
+is_sub = os.path.splitext(src)[1].lower() in (".srt", ".vtt")
+w_end = 99 if task != "ro" else 70     # cât din bara de progres ia Whisper
+
+if is_sub:
+    print("STAGE run", flush=True)
+    items = read_subs(src)
+    src_lang = "en"
+else:
+    from faster_whisper import WhisperModel
+    print("STAGE model", flush=True)
+    m = WhisperModel(model, device="cpu", compute_type="int8", cpu_threads=os.cpu_count() or 4,
+                     download_root=f"{B}/whisper-models")
+    print("STAGE run", flush=True)
+    wl = None if lang == "auto" else lang
+    wt = "translate" if task == "translate" else "transcribe"
+    segs, info = m.transcribe(src, language=wl, task=wt, vad_filter=True, beam_size=5)
+    src_lang = info.language
+    if task == "ro" and src_lang not in ("en", "ro"):
+        # altă limbă -> întâi în engleză cu Whisper, apoi în română
+        segs, info = m.transcribe(src, language=wl, task="translate", vad_filter=True, beam_size=5)
+        src_lang = "en"
+    dur = info.duration or 1
+    items = []
+    for sg in segs:
+        t = sg.text.strip()
+        if t: items.append((sg.start, sg.end, t))
+        P(sg.end / dur * w_end)
+    if task == "translate": src_lang = "en"
+
+out_lang = src_lang
+if task == "ro" and src_lang != "ro" and items:
+    print("STAGE tr", flush=True)
+    import torch
+    from transformers import MarianMTModel, MarianTokenizer
+    torch.set_num_threads(os.cpu_count() or 4)
+    last = None
+    for name in ("Helsinki-NLP/opus-mt-tc-big-en-ro", "Helsinki-NLP/opus-mt-en-ro"):
+        try:
+            tok = MarianTokenizer.from_pretrained(name); mt = MarianMTModel.from_pretrained(name).eval(); break
+        except Exception as e:
+            last = e; tok = None
+    if tok is None: raise SystemExit(f"Error: nu pot încărca modelul de traducere: {last}")
+    texts = [t for _, _, t in items]; res = []; bs = 16
+    start = 0 if is_sub else w_end
+    for n in range(0, len(texts), bs):
+        batch = texts[n:n + bs]
+        enc = tok(batch, return_tensors="pt", padding=True, truncation=True, max_length=256)
+        with torch.inference_mode():
+            gen = mt.generate(**enc, num_beams=3, max_new_tokens=256)
+        res += [x.strip() for x in tok.batch_decode(gen, skip_special_tokens=True)]
+        P(start + (n + len(batch)) / len(texts) * (99 - start))
+    # diacritice corecte (ș, ț cu virgulă)
+    fix = str.maketrans({"ş": "ș", "Ş": "Ș", "ţ": "ț", "Ţ": "Ț"})
+    items = [(a, b, r.translate(fix) or t) for (a, b, t), r in zip(items, res)]
+    out_lang = "ro"
+print("LANG " + out_lang, flush=True)
+
 def ts(x, sep):
     ms = int(round(x * 1000)); h, ms = divmod(ms, 3600000); m_, ms = divmod(ms, 60000); s_, ms = divmod(ms, 1000)
     return f"{h:02}:{m_:02}:{s_:02}{sep}{ms:03}"
@@ -604,12 +676,16 @@ def subs_page():
 def subupload():
     wm, lang = request.form.get("wmodel", "medium"), request.form.get("lang", "auto")
     task = request.form.get("task", "transcribe")
-    if wm not in WMODELS or lang not in WLANGS or task not in ("transcribe", "translate"): abort(400)
+    if wm not in WMODELS or lang not in WLANGS or task not in ("transcribe", "translate", "ro"): abort(400)
     ids = []
     for f in request.files.getlist("files"):
         if not f.filename: continue
         ext = os.path.splitext(f.filename)[1].lower() or ".bin"
-        jid = new_job(type="sub", name=os.path.splitext(f.filename)[0], path="", wmodel=wm, lang=lang, task=task)
+        is_sub = ext in (".srt", ".vtt")
+        nm = os.path.splitext(f.filename)[0]
+        if is_sub: nm = re.sub(r"[._-](en|eng|english)$", "", nm, flags=re.I)
+        jid = new_job(type="sub", name=nm, path="", wmodel="—" if is_sub else wm, lang=lang,
+                      task="ro" if is_sub else task)
         path = os.path.join(UP, jid + ext); f.save(path)
         jobs[jid]["path"] = path
         wq.put(jid); ids.append(jid)
@@ -644,7 +720,7 @@ def cv_videos():
 def subcv():
     wm, lang = request.form.get("wmodel", "medium"), request.form.get("lang", "auto")
     task = request.form.get("task", "transcribe")
-    if wm not in WMODELS or lang not in WLANGS or task not in ("transcribe", "translate"): abort(400)
+    if wm not in WMODELS or lang not in WLANGS or task not in ("transcribe", "translate", "ro"): abort(400)
     ids, errs = [], []
     paths = request.form.getlist("paths")
     for pth in paths:
@@ -1026,14 +1102,14 @@ SUBHTML = r"""<!doctype html><html lang="ro"><head><meta charset="utf-8">
 <div class="hd"><div><h1>📝 Subtitrări AI</h1><div class="sub">Transcriere și traducere automată cu Whisper · SRT / VTT / TXT</div></div>
 <a href="logout">👤 %USER% · Ieșire</a></div>
 <div class="drop" id="sdrop">📝 Trage aici filme, clipuri sau audio pentru subtitrare<br>
-<small style="color:var(--mu)">MP4, MKV, AVI, MP3, WAV… · rezultat SRT / VTT / TXT</small>
-<input type="file" id="sf" multiple accept="audio/*,video/*,.mkv,.avi,.ts" hidden></div>
+<small style="color:var(--mu)">MP4, MKV, AVI, MP3, WAV… sau o subtitrare .SRT în engleză de tradus · rezultat SRT / VTT / TXT</small>
+<input type="file" id="sf" multiple accept="audio/*,video/*,.mkv,.avi,.ts,.srt,.vtt" hidden></div>
 <div id="cvpick" hidden style="margin-top:12px">
  <input id="cvq" placeholder="🔎 Sau caută un film / episod direct din CineVerse (fără upload)…">
  <div id="cvres"></div>
 </div>
 <div class="row"><select id="wm">%WMODELS%</select><select id="wl">%WLANGS%</select>
-<select id="wt"><option value="transcribe">Transcriere (aceeași limbă)</option><option value="translate">Traducere în engleză</option></select>
+<select id="wt"><option value="ro">🇷🇴 Traducere în română</option><option value="transcribe">Transcriere (aceeași limbă)</option><option value="translate">🇬🇧 Traducere în engleză</option></select>
 <button class="p" id="sgo">Generează</button></div>
 <div id="ssel" class="sub"></div>
 <div id="list"></div></div>
@@ -1086,9 +1162,9 @@ $('#sgo').onclick=async()=>{
  x.onload=()=>{if(x.status===401)return location.href='login';sfiles=[];sinp.value='';$('#ssel').textContent='';last='';load()};x.send(fd)};
 const LN={ro:'Română',en:'English',it:'Italiano',es:'Español',fr:'Français',de:'Deutsch',hu:'Magyar',ru:'Русский',tr:'Türkçe'};
 function card(j){
- const stg=j.stage==='model'?'⬇️ Pregătesc modelul Whisper (prima dată se descarcă)…':j.stage==='run'?'⚙️ Transcriere '+j.progress+'%':'⏳ Pornire…';
+ const stg=j.stage==='model'?'⬇️ Pregătesc modelul Whisper (prima dată se descarcă)…':j.stage==='run'?'⚙️ Transcriere '+j.progress+'%':j.stage==='tr'?'🇷🇴 Traducere în română '+j.progress+'%':'⏳ Pornire…';
  const st={queued:'⏳ În așteptare'+(j.queue_pos?' (#'+j.queue_pos+')':''),processing:stg,done:'✅ Gata',error:'❌ Eroare'}[j.status];
- const meta=(j.cvsrc?'CineVerse · ':'')+j.wmodel+' · '+(j.task==='translate'?'→ English':(j.lang==='auto'?'auto':LN[j.lang]||j.lang));
+ const meta=(j.cvsrc?'CineVerse · ':'')+j.wmodel+' · '+(j.task==='translate'?'→ English':j.task==='ro'?'→ Română':(j.lang==='auto'?'auto':LN[j.lang]||j.lang));
  let body='';
  if(j.status==='processing'||j.status==='queued')body=`<div class="bar"><i style="width:${j.progress}%"></i></div>`;
  if(j.status==='done')body=`<div class="ana"><span>🌐 Limbă: <b>${esc(LN[j.dlang]||j.dlang||'?')}</b></span><span>💬 ${j.segs||0} replici</span></div>
@@ -1201,6 +1277,7 @@ Environment=PORT=$PORT
 Environment=OMP_NUM_THREADS=$(nproc)
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:$BASE/venv/bin
 Environment=NUMBA_CACHE_DIR=$BASE/.numba
+Environment=HF_HOME=$BASE/hf
 ExecStart=$BASE/venv/bin/python $BASE/app.py
 Restart=always
 Nice=10
