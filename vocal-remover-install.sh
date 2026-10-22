@@ -82,6 +82,7 @@ mkdir -p "$BASE"/{uploads,output,youtube}
 "$BASE/venv/bin/pip" install -q demucs==4.0.1 flask waitress soundfile "librosa>=0.10.2"
 "$BASE/venv/bin/pip" install -q -U "yt-dlp[default]"
 "$BASE/venv/bin/pip" install -q "faster-whisper>=1.1.0" "transformers>=4.44,<4.50" sentencepiece sacremoses
+"$BASE/venv/bin/pip" install -q -U "av>=14"
 
 echo "==> Modul subtitrări (Whisper)..."
 mkdir -p "$BASE/whisper-models"
@@ -127,18 +128,27 @@ if is_sub:
     items = read_subs(src)
     src_lang = "en"
 else:
+    import subprocess, numpy as np
     from faster_whisper import WhisperModel
     print("STAGE model", flush=True)
     m = WhisperModel(model, device="cpu", compute_type="int8", cpu_threads=os.cpu_count() or 4,
                      download_root=f"{B}/whisper-models")
-    print("STAGE run", flush=True)
     wl = None if lang == "auto" else lang
     wt = "translate" if task == "translate" else "transcribe"
-    segs, info = m.transcribe(src, language=wl, task=wt, vad_filter=True, beam_size=5)
+    # audio extras cu ffmpeg (16 kHz mono) – funcționează cu orice format, fără PyAV
+    print("STAGE audio", flush=True)
+    r = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", src, "-map", "0:a:0",
+                        "-ac", "1", "-ar", "16000", "-f", "s16le", "-"], capture_output=True)
+    if r.returncode != 0 or not r.stdout:
+        raise SystemExit("Error: nu pot extrage sunetul: " + r.stderr.decode(errors="replace")[-300:])
+    audio = np.frombuffer(r.stdout, np.int16).astype(np.float32) / 32768.0
+    del r
+    print("STAGE run", flush=True)
+    segs, info = m.transcribe(audio, language=wl, task=wt, vad_filter=True, beam_size=5)
     src_lang = info.language
     if task == "ro" and src_lang not in ("en", "ro"):
         # altă limbă -> întâi în engleză cu Whisper, apoi în română
-        segs, info = m.transcribe(src, language=wl, task="translate", vad_filter=True, beam_size=5)
+        segs, info = m.transcribe(audio, language=wl, task="translate", vad_filter=True, beam_size=5)
         src_lang = "en"
     dur = info.duration or 1
     items = []
@@ -1162,7 +1172,7 @@ $('#sgo').onclick=async()=>{
  x.onload=()=>{if(x.status===401)return location.href='login';sfiles=[];sinp.value='';$('#ssel').textContent='';last='';load()};x.send(fd)};
 const LN={ro:'Română',en:'English',it:'Italiano',es:'Español',fr:'Français',de:'Deutsch',hu:'Magyar',ru:'Русский',tr:'Türkçe'};
 function card(j){
- const stg=j.stage==='model'?'⬇️ Pregătesc modelul Whisper (prima dată se descarcă)…':j.stage==='run'?'⚙️ Transcriere '+j.progress+'%':j.stage==='tr'?'🇷🇴 Traducere în română '+j.progress+'%':'⏳ Pornire…';
+ const stg=j.stage==='model'?'⬇️ Pregătesc modelul Whisper (prima dată se descarcă)…':j.stage==='audio'?'🎧 Extrag sunetul…':j.stage==='run'?'⚙️ Transcriere '+j.progress+'%':j.stage==='tr'?'🇷🇴 Traducere în română '+j.progress+'%':'⏳ Pornire…';
  const st={queued:'⏳ În așteptare'+(j.queue_pos?' (#'+j.queue_pos+')':''),processing:stg,done:'✅ Gata',error:'❌ Eroare'}[j.status];
  const meta=(j.cvsrc?'CineVerse · ':'')+j.wmodel+' · '+(j.task==='translate'?'→ English':j.task==='ro'?'→ Română':(j.lang==='auto'?'auto':LN[j.lang]||j.lang));
  let body='';
