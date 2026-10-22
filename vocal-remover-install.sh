@@ -282,7 +282,7 @@ PYEOF
 
 echo "==> Aplicație web..."
 cat > "$BASE/app.py" <<'PYEOF'
-import os, re, uuid, glob, json, shutil, threading, queue, subprocess, time, functools, html
+import os, re, uuid, glob, json, shutil, threading, queue, subprocess, time, functools, html, signal
 from flask import Flask, request, jsonify, send_file, abort, Response, session, redirect
 from werkzeug.security import check_password_hash
 
@@ -367,9 +367,38 @@ def load():
                 if s["status"] in ("queued", "processing"):
                     s["status"] = "queued"; fxq.put(("shift", jid, s["id"]))
 
+# ---------- oprire joburi ----------
+procs = {}          # jid -> proces în lucru (grup propriu, ca să oprim și ffmpeg-ul pornit de el)
+STOPPED = "⏹ Oprit de utilizator"
+
+class Stopped(Exception): pass
+
+def start_proc(jid, cmd):
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                         errors="replace", start_new_session=True)
+    procs[jid] = p
+    return p
+
+def stop_job(jid):
+    j = jobs.get(jid)
+    if j and j.get("status") in ("queued", "processing"):
+        j["cancel"] = True
+        if j["status"] == "queued": j.update(status="stopped", error=STOPPED)
+    p = procs.get(jid)
+    if p and p.poll() is None:
+        try: os.killpg(p.pid, signal.SIGTERM)
+        except Exception: pass
+        try: p.wait(timeout=5)
+        except Exception:
+            try: os.killpg(p.pid, signal.SIGKILL)
+            except Exception: pass
+    save()
+
+def check_stop(j):
+    if j.get("cancel"): raise Stopped()
+
 def run(cmd, j, pattern):
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, bufsize=1, errors="replace")
+    p = start_proc(j["id"], cmd)
     log = []
     for line in p.stdout:
         log.append(line); log = log[-40:]
@@ -379,12 +408,18 @@ def run(cmd, j, pattern):
             d = re.search(r"Destination: (.+)$", line.strip())
             if d: j["name"] = os.path.splitext(os.path.basename(d.group(1)))[0]
     p.wait()
+    procs.pop(j["id"], None)
+    check_stop(j)
     return p.returncode, log
 
 def sep_worker():
     while True:
         jid = sq.get(); j = jobs.get(jid)
         if not j: continue
+        if j.get("cancel"):
+            try: os.remove(j["path"])
+            except Exception: pass
+            continue
         j["status"], j["progress"] = "processing", 0; save()
         od = os.path.join(OUT, jid)
         four = j.get("mode") == "sep4"
@@ -410,6 +445,8 @@ def sep_worker():
             j.update(status="done", progress=100, ext=ext, finished=time.time(), ana="queued")
             fxq.put(("ana", jid))
             auto_shift(j)
+        except Stopped:
+            j.update(status="stopped", error=STOPPED); shutil.rmtree(od, ignore_errors=True)
         except Exception as e:
             j.update(status="error", error=str(e)[-400:])
         finally:
@@ -421,14 +458,18 @@ def sub_worker():
     while True:
         jid = wq.get(); j = jobs.get(jid)
         if not j: continue
+        if j.get("cancel"):
+            if not j.get("cvsrc"):
+                try: os.remove(j["path"])
+                except Exception: pass
+            continue
         j.update(status="processing", progress=0, stage="queued"); save()
         od = os.path.join(OUT, jid); os.makedirs(od, exist_ok=True)
         try:
             with heavy:
-                p = subprocess.Popen([PY, f"{BASE}/transcribe.py", j["path"], od, j["wmodel"], j["lang"], j["task"],
-                                      "1" if j.get("emb", True) else "0"],
-                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-                                     errors="replace")
+                check_stop(j)
+                p = start_proc(jid, [PY, f"{BASE}/transcribe.py", j["path"], od, j["wmodel"], j["lang"], j["task"],
+                                     "1" if j.get("emb", True) else "0"])
                 log = []
                 for line in p.stdout:
                     line = line.strip(); log.append(line); log = log[-40:]
@@ -437,7 +478,8 @@ def sub_worker():
                     elif line.startswith("P "): j["progress"] = int(line[2:])
                     elif line.startswith("DONE "): j["segs"] = json.loads(line[5:])["segs"]
                     elif line.startswith("SRC "): j["srcinfo"] = line[4:]
-                p.wait()
+                p.wait(); procs.pop(jid, None)
+            check_stop(j)
             if p.returncode != 0 or not os.path.exists(f"{od}/sub.srt"):
                 err = [l for l in log if "Error" in l or "error" in l]
                 raise RuntimeError("\n".join(err[-3:] or log[-6:]) or "Whisper a eșuat")
@@ -445,6 +487,8 @@ def sub_worker():
             if j.get("cvsrc"):
                 try: cv_put_sub(j, j["path"])
                 except Exception as e: j["cverr"] = str(e)[-200:]
+        except Stopped:
+            j.update(status="stopped", error=STOPPED, stage=""); shutil.rmtree(od, ignore_errors=True)
         except Exception as e:
             j.update(status="error", error=str(e)[-400:])
         finally:
@@ -456,7 +500,7 @@ def sub_worker():
 def yt_worker():
     while True:
         jid = yq.get(); j = jobs.get(jid)
-        if not j: continue
+        if not j or j.get("cancel"): continue
         j["status"], j["progress"] = "processing", 0; save()
         od = os.path.join(YTD, jid)
         shutil.rmtree(od, ignore_errors=True); os.makedirs(od)
@@ -488,6 +532,8 @@ def yt_worker():
                 shutil.copy(fp, path)
                 jobs[sid]["path"] = path
                 sq.put(sid)
+        except Stopped:
+            j.update(status="stopped", error=STOPPED); shutil.rmtree(od, ignore_errors=True)
         except Exception as e:
             j.update(status="error", error=str(e)[-400:])
             shutil.rmtree(od, ignore_errors=True)
@@ -940,12 +986,24 @@ def delshift(jid, sid):
         save()
     return jsonify(ok=True)
 
+@app.route("/stop/<jid>", methods=["POST"])
+def stop(jid):
+    if (jobs.get(jid) or {}).get("type") == "sub": abort(404)
+    stop_job(jid); return jsonify(ok=True)
+
+@app.route("/subtitrari/api/stop/<jid>", methods=["POST"])
+@need_auth
+def subs_stop(jid):
+    if (jobs.get(jid) or {}).get("type") != "sub": abort(404)
+    stop_job(jid); return jsonify(ok=True)
+
 @app.route("/delete/<jid>", methods=["POST"])
 def delete(jid):
     if (jobs.get(jid) or {}).get("type") == "sub": abort(404)
     return delete_job(jid)
 
 def delete_job(jid):
+    stop_job(jid)            # ✕ pe un job în lucru îl oprește întâi
     with lock: j = jobs.pop(jid, None)
     if j:
         shutil.rmtree(f"{OUT}/{jid}", ignore_errors=True)
@@ -985,6 +1043,8 @@ label.chk{display:flex;align-items:center;gap:6px;color:var(--mu);font-size:14px
 audio{width:100%;margin:6px 0}video{width:100%;max-height:380px;border-radius:8px;background:#000;margin:6px 0}
 a.d{color:var(--ok);font-size:13px;text-decoration:none}
 .x{background:none;border:none;color:var(--mu);cursor:pointer;font-size:18px;padding:0 4px}
+.stp{background:#3a1417;border:1px solid #6b1d24;color:#ff8a8a;border-radius:8px;padding:3px 9px;font-size:12px;cursor:pointer;margin-left:8px}
+.stp:hover{background:#5a1a20}
 .err{color:#ff6b6b;font-size:12px;margin-top:8px;white-space:pre-wrap;word-break:break-word}
 .ana{display:flex;gap:16px;flex-wrap:wrap;margin-top:12px;font-size:14px}.ana span{background:var(--bg);border-radius:8px;padding:6px 10px}
 .fx{background:var(--bg);border-radius:10px;padding:12px;margin-top:10px;display:grid;grid-template-columns:auto 1fr auto;gap:10px 12px;align-items:center;font-size:13px}
@@ -1121,7 +1181,7 @@ async function applyFx(id){const c=C(byId[id]);if(!c.semi&&c.tempo===100)return 
 async function delShift(id,sid){await fetch('delshift/'+id+'/'+sid,{method:'POST'});last='';load()}
 
 function card(j){const yt=j.type==='yt';
- const st={queued:'⏳ În așteptare'+(j.queue_pos?' (#'+j.queue_pos+')':''),processing:'⚙️ '+(yt?'Descărcare ':'Procesare ')+j.progress+'%',done:'✅ Gata',error:'❌ Eroare'}[j.status];
+ const st={queued:'⏳ În așteptare'+(j.queue_pos?' (#'+j.queue_pos+')':''),processing:'⚙️ '+(yt?'Descărcare ':'Procesare ')+j.progress+'%',done:'✅ Gata',error:'❌ Eroare',stopped:'⏹ Oprit'}[j.status];
  const meta=yt?(j.fmt==='mp3'?'YouTube · MP3':'YouTube · '+(j.fmt==='best'?'max':j.fmt+'p')):(j.mode==='ana'?'tonalitate/tempo':j.mode==='sep4'?'4 piste · '+j.model:j.model)+' · '+j.fmt;
  let body='';
  if(j.status==='processing'||j.status==='queued')body=`<div class="bar"><i style="width:${j.progress}%"></i></div>`;
@@ -1133,9 +1193,9 @@ function card(j){const yt=j.type==='yt';
   else{const tk=TRK(j);
    body=`<div class="res${tk.length===1?' one':''}">${tk.map(k=>`<div><b>${TL[k]}</b>
    <audio controls preload="none" src="dl/${j.id}/${k}?play=1"></audio><a class="d" href="dl/${j.id}/${k}">⬇ Descarcă</a></div>`).join('')}</div>`+fx(j)}}
- if(j.status==='error')body=`<div class="err">${esc(j.error)}</div>`;
+ if(j.status==='error'||j.status==='stopped')body=`<div class="err">${esc(j.error)}</div>`;
  return `<div class="job"><div class="top"><div class="nm">${yt?'▶️':'🎤'} ${esc(j.name)}</div>
-  <div><span class="st">${st} · ${esc(meta)}</span><button class="x" title="Șterge" onclick="del('${j.id}')">✕</button></div></div>${body}</div>`}
+  <div><span class="st">${st} · ${esc(meta)}</span>${j.status==='queued'||j.status==='processing'?`<button class="stp" title="Oprește" onclick="stopJob('${j.id}')">⏹ Stop</button>`:''}<button class="x" title="Șterge" onclick="del('${j.id}')">✕</button></div></div>${body}</div>`}
 let last='';
 async function load(){try{const t=await (await fetch('jobs')).text();if(t===last)return;last=t;
  const d=JSON.parse(t);d.forEach(j=>byId[j.id]=j);L.innerHTML=d.map(card).join('')}catch(e){}}
@@ -1144,6 +1204,7 @@ const busy=()=>dragging||[...document.querySelectorAll('audio,video')].some(a=>!
  (document.activeElement&&document.activeElement.tagName==='SELECT'&&L.contains(document.activeElement));
 setInterval(()=>{if(!busy())load()},2500);
 async function del(id){if(confirm('Ștergi?')){await fetch('delete/'+id,{method:'POST'});last='';load()}}
+async function stopJob(id){if(confirm('Oprești procesarea?')){await fetch('stop/'+id,{method:'POST'});last='';load()}}
 load();
 </script></body></html>"""
 
@@ -1237,7 +1298,7 @@ $('#sgo').onclick=async()=>{
 const LN={ro:'Română',en:'English',it:'Italiano',es:'Español',fr:'Français',de:'Deutsch',hu:'Magyar',ru:'Русский',tr:'Türkçe'};
 function card(j){
  const stg=j.stage==='model'?'⬇️ Pregătesc modelul Whisper (prima dată se descarcă)…':j.stage==='audio'?'🎧 Extrag sunetul…':j.stage==='emb'?'📄 Caut subtitrări în film…':j.stage==='run'?'⚙️ Transcriere '+j.progress+'%':j.stage==='tr'?'🇷🇴 Traducere în română '+j.progress+'%':'⏳ Pornire…';
- const st={queued:'⏳ În așteptare'+(j.queue_pos?' (#'+j.queue_pos+')':''),processing:stg,done:'✅ Gata',error:'❌ Eroare'}[j.status];
+ const st={queued:'⏳ În așteptare'+(j.queue_pos?' (#'+j.queue_pos+')':''),processing:stg,done:'✅ Gata',error:'❌ Eroare',stopped:'⏹ Oprit'}[j.status];
  const meta=(j.cvsrc?'CineVerse · ':'')+j.wmodel+' · '+(j.task==='translate'?'→ English':j.task==='ro'?'→ Română':(j.lang==='auto'?'auto':LN[j.lang]||j.lang));
  let body='';
  if(j.status==='processing'||j.status==='queued')body=`<div class="bar"><i style="width:${j.progress}%"></i></div>`;
@@ -1247,13 +1308,14 @@ function card(j){
   +(j.cv?`<div class="ok">✅ În CineVerse: ${esc(j.cv)}</div>`:CV.enabled?`<div class="cvbox"><button onclick="cvVideoPick('${j.id}')">📺 Trimite în CineVerse</button>
    <select id="cvv_${j.id}" hidden></select><button class="p" id="cvb_${j.id}" hidden onclick="cvSend('${j.id}')">Pune subtitrarea lângă film</button></div>`:'')
   +(j.cverr?`<div class="err">CineVerse: ${esc(j.cverr)}</div>`:'');
- if(j.status==='error')body=`<div class="err">${esc(j.error)}</div>`;
+ if(j.status==='error'||j.status==='stopped')body=`<div class="err">${esc(j.error)}</div>`;
  return `<div class="job"><div class="top"><div class="nm">📝 ${esc(j.name)}</div>
-  <div><span class="st">${st} · ${esc(meta)}</span><button class="x" title="Șterge" onclick="del('${j.id}')">✕</button></div></div>${body}</div>`}
+  <div><span class="st">${st} · ${esc(meta)}</span>${j.status==='queued'||j.status==='processing'?`<button class="stp" title="Oprește" onclick="stopJob('${j.id}')">⏹ Stop</button>`:''}<button class="x" title="Șterge" onclick="del('${j.id}')">✕</button></div></div>${body}</div>`}
 let last='';const L=$('#list');
 async function load(){try{const t=await (await api('jobs')).text();if(t===last)return;last=t;L.innerHTML=JSON.parse(t).map(card).join('')}catch(e){}}
 setInterval(()=>{const a=document.activeElement;if(!(a&&a.tagName==='SELECT'&&L.contains(a)))load()},2500);
 async function del(id){if(confirm('Ștergi?')){await api('delete/'+id,{method:'POST'});last='';load()}}
+async function stopJob(id){if(confirm('Oprești procesarea?')){await api('stop/'+id,{method:'POST'});last='';load()}}
 load();
 </script></body></html>"""
 
