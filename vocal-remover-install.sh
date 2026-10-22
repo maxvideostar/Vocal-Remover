@@ -639,14 +639,24 @@ def subcv():
     wm, lang = request.form.get("wmodel", "medium"), request.form.get("lang", "auto")
     task = request.form.get("task", "transcribe")
     if wm not in WMODELS or lang not in WLANGS or task not in ("transcribe", "translate"): abort(400)
-    ids = []
-    for pth in request.form.getlist("paths"):
-        if not (os.path.isfile(pth) and cv_inside(pth)): continue
-        jid = new_job(type="sub", name=os.path.splitext(os.path.basename(pth))[0], path=pth, cvsrc=True,
-                      wmodel=wm, lang=lang, task=task)
-        wq.put(jid); ids.append(jid)
+    ids, errs = [], []
+    paths = request.form.getlist("paths")
+    for pth in paths:
+        nm = os.path.basename(pth)
+        if not cv_inside(pth):
+            errs.append(f"{nm}: nu e într-un folder CineVerse")
+        elif not os.path.isfile(pth):
+            errs.append(f"{nm}: fișierul nu există")
+        elif not os.access(pth, os.R_OK):
+            errs.append(f"{nm}: fără drept de citire (rulează din nou installer-ul)")
+        else:
+            jid = new_job(type="sub", name=os.path.splitext(nm)[0], path=pth, cvsrc=True,
+                          wmodel=wm, lang=lang, task=task)
+            wq.put(jid); ids.append(jid)
+    for e in errs: print("subtitrare CineVerse:", e, flush=True)
+    if not paths: errs.append("Niciun film selectat")
     save()
-    return jsonify(ids)
+    return jsonify(ids=ids, errors=errs)
 
 @app.route("/subtitrari/api/send/<jid>", methods=["POST"])
 @need_auth
@@ -1054,7 +1064,15 @@ const opts=fd=>{fd.append('wmodel',$('#wm').value);fd.append('lang',$('#wl').val
  try{localStorage.setItem('wopt',JSON.stringify({wm:$('#wm').value,wl:$('#wl').value,wt:$('#wt').value}))}catch(e){}};
 $('#sgo').onclick=async()=>{
  if(cvSel.size&&!sfiles.length){const fd=new FormData();[...cvSel].forEach(p=>fd.append('paths',p));opts(fd);
-  await api('fromcv',{method:'POST',body:fd});cvSel.clear();$('#cvres').innerHTML='';$('#cvq').value='';$('#ssel').textContent='';last='';return load()}
+  $('#sgo').disabled=true;$('#ssel').textContent='Se trimite…';
+  let d={ids:[],errors:['Eroare server']};
+  try{const r=await api('fromcv',{method:'POST',body:fd});d=await r.json().catch(()=>({ids:[],errors:['Eroare server ('+r.status+')']}))}catch(e){}
+  $('#sgo').disabled=false;
+  if(!d.ids||!d.ids.length){$('#ssel').textContent='';return alert('Nu am putut porni subtitrarea:\n'+(d.errors||[]).join('\n'))}
+  if(d.errors&&d.errors.length)alert('Unele filme au fost sărite:\n'+d.errors.join('\n'));
+  cvSel.clear();$('#cvres').innerHTML='';$('#cvq').value='';
+  $('#ssel').textContent='✅ '+d.ids.length+' film(e) adăugate în coadă';setTimeout(()=>$('#ssel').textContent='',4000);
+  last='';return load()}
  if(!sfiles.length)return alert('Alege fișiere sau un film din CineVerse!');
  const fd=new FormData();sfiles.forEach(f=>fd.append('files',f));opts(fd);
  const x=new XMLHttpRequest();x.open('POST','api/upload');
