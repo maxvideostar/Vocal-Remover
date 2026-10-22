@@ -26,7 +26,9 @@ Separare **voce / instrumental** cu AI ([Demucs](https://github.com/facebookrese
 - Se aplică pe Instrumental, Voce sau ambele (pentru voce se păstrează timbrul natural)
 - Mod **„Doar tonalitate/tempo”** pentru melodii pe care vrei doar să le transpui, fără separare
 
-### 📝 Subtitrări AI (Whisper)
+### 📝 Subtitrări AI (Whisper) · pagină separată `/subtitrari/`
+- Pagină proprie, **protejată cu utilizator și parolă** (login cu sesiune, „ține-mă minte 30 de zile”, blocare după 5 încercări greșite)
+- Parola se setează la instalare și se schimbă oricând cu `sudo subtitrari-parola`
 - Încarci un film, clip sau fișier audio și primești subtitrarea în **SRT**, **VTT** și **TXT**
 - Detectare automată a limbii, sau alegi tu (română, engleză etc.)
 - Opțiune **„Traducere în engleză”**
@@ -100,12 +102,14 @@ Fișierele aplicației se află în `/opt/vocal-remover/`:
 └── jobs.json     # istoric / coadă
 ```
 
+Acces: Vocal Remover pe `http://IP-SERVER:8095`, Subtitrări pe `http://IP-SERVER:8095/subtitrari/` (extern: `https://domeniu/vocal/` și `https://domeniu/subtitrari/`).
+
 Pentru alt port, modifică `PORT=` în script înainte de instalare.
 
 Instalare neinteractivă, cu nginx:
 
 ```bash
-sudo DOMAIN=exemplu.ro SETUP_NGINX=yes VR_USER=admin VR_PASS='parola' bash vocal-remover-install.sh
+sudo DOMAIN=exemplu.ro SETUP_NGINX=yes VR_USER=admin VR_PASS='parola' SUB_USER=admin SUB_PASS='parola2' bash vocal-remover-install.sh
 ```
 
 Scriptul poate fi rulat din nou oricând pentru update; istoricul se păstrează.
@@ -115,7 +119,7 @@ Scriptul poate fi rulat din nou oricând pentru update; istoricul se păstrează
 ```bash
 sudo systemctl disable --now vocal-remover
 sudo rm /etc/systemd/system/vocal-remover.service
-sudo rm -rf /opt/vocal-remover /etc/cron.daily/vocal-remover-ytdlp
+sudo rm -rf /opt/vocal-remover /etc/cron.daily/vocal-remover-ytdlp /usr/local/bin/subtitrari-parola
 sudo systemctl daemon-reload
 ```
 

@@ -3,12 +3,15 @@
 #  Vocal Remover (Demucs AI) + YouTube Downloader + Web UI
 #  Ubuntu 22.04 / 24.04
 #
-#  Rulare:   sudo bash vocal-remover-install.sh
-#  Acces:    http://IP-SERVER:8095
-#  Extern:   https://DOMENIU/vocal/   (opțional, nginx + parolă)
+#  Rulare:      sudo bash vocal-remover-install.sh
+#  Acces:       http://IP-SERVER:8095
+#  Subtitrări:  http://IP-SERVER:8095/subtitrari/   (pagină separată, cu parolă)
+#  Extern:      https://DOMENIU/vocal/  și  https://DOMENIU/subtitrari/
+#  Parolă nouă pentru Subtitrări:  sudo subtitrari-parola
 #
 #  Variabile opționale (pentru rulare neinteractivă):
 #    DOMAIN=testcam.go.ro  SETUP_NGINX=yes|no  VR_USER=admin  VR_PASS=parola
+#    SUB_USER=admin  SUB_PASS=parola
 # ============================================================
 set -e
 [ "$EUID" -ne 0 ] && { echo "Rulează cu sudo!"; exit 1; }
@@ -34,6 +37,23 @@ if [ "$SETUP_NGINX" = "yes" ]; then
     read -rsp "Confirmă parola: " p2; echo
     [ "$VR_PASS" != "$p2" ] && { echo "Parolele nu coincid."; VR_PASS=""; }
   done
+fi
+
+# parola paginii Subtitrări (doar la prima instalare sau dacă e dată SUB_PASS)
+SUB_GEN=""
+if [ ! -f "$BASE/subauth.json" ] || [ -n "$SUB_PASS" ]; then
+  if [ -z "$SUB_PASS" ] && [ -t 0 ]; then
+    echo "Pagina 📝 Subtitrări are login separat."
+    read -rp "Utilizator Subtitrări [admin]: " SUB_USER; SUB_USER="${SUB_USER:-admin}"
+    while [ -z "$SUB_PASS" ]; do
+      read -rsp "Parolă Subtitrări: " SUB_PASS; echo
+      read -rsp "Confirmă parola: " p2; echo
+      [ "$SUB_PASS" != "$p2" ] && { echo "Parolele nu coincid."; SUB_PASS=""; }
+    done
+  elif [ -z "$SUB_PASS" ]; then
+    SUB_PASS=$(openssl rand -base64 12 2>/dev/null || date +%s%N | sha256sum | head -c 16); SUB_GEN=1
+  fi
+  SUB_USER="${SUB_USER:-admin}"
 fi
 
 echo "==> Pachete sistem..."
@@ -122,8 +142,9 @@ PYEOF
 
 echo "==> Aplicație web..."
 cat > "$BASE/app.py" <<'PYEOF'
-import os, re, uuid, glob, json, shutil, threading, queue, subprocess, time
-from flask import Flask, request, jsonify, send_file, abort, Response
+import os, re, uuid, glob, json, shutil, threading, queue, subprocess, time, functools, html
+from flask import Flask, request, jsonify, send_file, abort, Response, session, redirect
+from werkzeug.security import check_password_hash
 
 BASE = "/opt/vocal-remover"
 UP, OUT, YTD = f"{BASE}/uploads", f"{BASE}/output", f"{BASE}/youtube"
@@ -507,7 +528,73 @@ def upload():
     save()
     return jsonify(ids)
 
-@app.route("/subupload", methods=["POST"])
+# ======================= Subtitrări (pagină separată, cu parolă) =======================
+AUTHF, SECRETF = f"{BASE}/subauth.json", f"{BASE}/.secret"
+if not os.path.exists(SECRETF):
+    with open(SECRETF, "w") as f: f.write(uuid.uuid4().hex + uuid.uuid4().hex)
+    os.chmod(SECRETF, 0o600)
+app.secret_key = open(SECRETF).read().strip()
+app.config.update(SESSION_COOKIE_NAME="vr_subs", SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
+                  PERMANENT_SESSION_LIFETIME=30 * 86400)
+_fails = {}
+
+def sub_auth():
+    try: return json.load(open(AUTHF))
+    except Exception: return None
+
+def authed():
+    a = sub_auth()
+    return bool(a) and session.get("u") == a["user"] and session.get("v") == a["hash"][-12:]
+
+def client_ip():
+    ip = request.remote_addr or ""
+    return request.headers.get("X-Real-IP", ip) if ip in ("127.0.0.1", "::1") else ip
+
+def need_auth(f):
+    @functools.wraps(f)
+    def w(*a, **k):
+        if authed(): return f(*a, **k)
+        if request.path.startswith("/subtitrari/api/"): return jsonify(error="Neautentificat"), 401
+        return redirect("/subtitrari/login")
+    return w
+
+@app.route("/subtitrari")
+def subs_noslash(): return redirect("/subtitrari/")
+
+@app.route("/subtitrari/login", methods=["GET", "POST"])
+def subs_login():
+    a, msg = sub_auth(), ""
+    if not a:
+        msg = "Parola nu e setată. Pe server rulează: <code>sudo subtitrari-parola</code>"
+    elif request.method == "POST":
+        ip, now = client_ip(), time.time()
+        _fails[ip] = [t for t in _fails.get(ip, []) if now - t < 600]
+        if len(_fails[ip]) >= 5:
+            msg = "Prea multe încercări greșite. Încearcă din nou peste 10 minute."
+        elif request.form.get("u", "") == a["user"] and check_password_hash(a["hash"], request.form.get("p", "")):
+            session.clear(); session.permanent = request.form.get("r") == "1"
+            session.update(u=a["user"], v=a["hash"][-12:])
+            _fails.pop(ip, None)
+            return redirect("/subtitrari/")
+        else:
+            _fails[ip].append(now); time.sleep(1)
+            msg = "Utilizator sau parolă greșită."
+    return Response(LOGIN.replace("%CSS%", CSS).replace("%MSG%", f'<div class="err">{msg}</div>' if msg else ""),
+                    mimetype="text/html")
+
+@app.route("/subtitrari/logout")
+def subs_logout():
+    session.clear(); return redirect("/subtitrari/login")
+
+@app.route("/subtitrari/")
+@need_auth
+def subs_page():
+    o = lambda d: "".join(f'<option value="{k}">{v}</option>' for k, v in d.items())
+    return Response(SUBHTML.replace("%CSS%", CSS).replace("%WMODELS%", o(WMODELS)).replace("%WLANGS%", o(WLANGS))
+                    .replace("%USER%", html.escape(session.get("u", ""))), mimetype="text/html")
+
+@app.route("/subtitrari/api/upload", methods=["POST"])
+@need_auth
 def subupload():
     wm, lang = request.form.get("wmodel", "medium"), request.form.get("lang", "auto")
     task = request.form.get("task", "transcribe")
@@ -528,7 +615,12 @@ def cv_info():
     ds = cv_dirs()
     return jsonify(enabled=bool(ds), dirs=[{"i": i, "name": os.path.basename(d.rstrip("/")) or d, "path": d} for i, d in enumerate(ds)])
 
-@app.route("/cv/videos")
+@app.route("/subtitrari/api/cv")
+@need_auth
+def subs_cv_info(): return cv_info()
+
+@app.route("/subtitrari/api/videos")
+@need_auth
 def cv_videos():
     words = request.args.get("q", "").lower().split()
     roots = cv_dirs(); res = []
@@ -541,7 +633,8 @@ def cv_videos():
             if len(res) >= 60: break
     return jsonify(res)
 
-@app.route("/subcv", methods=["POST"])
+@app.route("/subtitrari/api/fromcv", methods=["POST"])
+@need_auth
 def subcv():
     wm, lang = request.form.get("wmodel", "medium"), request.form.get("lang", "auto")
     task = request.form.get("task", "transcribe")
@@ -555,10 +648,21 @@ def subcv():
     save()
     return jsonify(ids)
 
+@app.route("/subtitrari/api/send/<jid>", methods=["POST"])
+@need_auth
+def subs_send(jid):
+    j = jobs.get(jid)
+    if not j or j.get("type") != "sub": abort(404)
+    return cv_send_job(j)
+
 @app.route("/cv/send/<jid>", methods=["POST"])
 def cv_send(jid):
     j = jobs.get(jid)
-    if not j or j["status"] != "done": abort(404)
+    if not j or j.get("type") != "yt": abort(404)
+    return cv_send_job(j)
+
+def cv_send_job(j):
+    if j["status"] != "done": abort(404)
     ds = cv_dirs()
     if not ds: return jsonify(ok=False, error="CineVerse nu e configurat"), 400
     try:
@@ -595,14 +699,38 @@ def yt():
     save()
     return jsonify(ids)
 
-@app.route("/jobs")
-def list_jobs():
+def jobs_json(kind):
     pos = {jid: i + 1 for qq in (sq, yq, wq) for i, jid in enumerate(list(qq.queue))}
     for i, t in enumerate([t for t in list(fxq.queue) if t[0] == "conv"]): pos[t[1]] = i + 1
     keys = ("id", "type", "mode", "name", "model", "fmt", "status", "progress", "error", "ext",
             "ana", "key", "kmode", "bpm", "shifts", "wmodel", "lang", "task", "dlang", "segs", "stage", "cv", "cvsrc", "cverr")
     with lock: js = sorted(jobs.values(), key=lambda x: -x["created"])
+    js = [j for j in js if (j.get("type") == "sub") == (kind == "sub")]
     return jsonify([{**{k: j.get(k) for k in keys}, "queue_pos": pos.get(j["id"], 0)} for j in js])
+
+@app.route("/subtitrari/api/jobs")
+@need_auth
+def subs_jobs(): return jobs_json("sub")
+
+@app.route("/subtitrari/api/dl/<jid>/<kind>")
+@need_auth
+def subs_dl(jid, kind):
+    j = jobs.get(jid)
+    if not j or j.get("type") != "sub" or j["status"] != "done" or kind not in ("srt", "vtt", "txt"): abort(404)
+    f = f"{OUT}/{jid}/sub.{kind}"
+    if not os.path.exists(f): abort(404)
+    lg = j.get("dlang") or "und"
+    return send_file(f, as_attachment=request.args.get("play") is None, mimetype="text/plain; charset=utf-8",
+                     download_name=f"{j['name']}.{lg}.{kind}")
+
+@app.route("/subtitrari/api/delete/<jid>", methods=["POST"])
+@need_auth
+def subs_delete(jid):
+    if (jobs.get(jid) or {}).get("type") != "sub": abort(404)
+    return delete_job(jid)
+
+@app.route("/jobs")
+def list_jobs(): return jobs_json("main")
 
 @app.route("/dl/<jid>/<kind>")
 def dl(jid, kind):
@@ -613,13 +741,7 @@ def dl(jid, kind):
         if kind != "file" or not os.path.exists(j.get("file", "")): abort(404)
         return send_file(j["file"], as_attachment=not play,
                          download_name=f"{j['name']}.{j['ext']}", conditional=True)
-    if j.get("type") == "sub":
-        if kind not in ("srt", "vtt", "txt"): abort(404)
-        f = f"{OUT}/{jid}/sub.{kind}"
-        if not os.path.exists(f): abort(404)
-        lg = j.get("dlang") or "und"
-        return send_file(f, as_attachment=not play, mimetype="text/plain; charset=utf-8",
-                         download_name=f"{j['name']}.{lg}.{kind}" if kind != "txt" else f"{j['name']}.{lg}.txt")
+    if j.get("type") == "sub": abort(404)
     if kind.startswith("s_"):
         s = next((x for x in j.get("shifts", []) if x["id"] == kind[2:]), None)
         if not s or s["status"] != "done": abort(404)
@@ -658,12 +780,17 @@ def delshift(jid, sid):
 
 @app.route("/delete/<jid>", methods=["POST"])
 def delete(jid):
+    if (jobs.get(jid) or {}).get("type") == "sub": abort(404)
+    return delete_job(jid)
+
+def delete_job(jid):
     with lock: j = jobs.pop(jid, None)
     if j:
         shutil.rmtree(f"{OUT}/{jid}", ignore_errors=True)
         shutil.rmtree(f"{YTD}/{jid}", ignore_errors=True)
-        try: os.remove(j.get("path", ""))
-        except Exception: pass
+        if not j.get("cvsrc"):
+            try: os.remove(j.get("path", ""))
+            except Exception: pass
         save()
     return jsonify(ok=True)
 
@@ -713,8 +840,8 @@ a.d{color:var(--ok);font-size:13px;text-decoration:none}
 .sh{display:flex;flex-direction:column;gap:4px;margin-top:8px;background:var(--bg);border-radius:10px;padding:10px}
 .sh .top{flex-direction:row!important;align-items:center}.sh .top b{font-size:13px}
 </style></head><body><div class="w">
-<h1>🎤 Vocal Remover</h1><div class="sub">Separare voce · Tonalitate & tempo · Subtitrări AI · YouTube</div>
-<div class="tabs"><button class="t on" data-t="sep">🎤 Separare voce</button><button class="t" data-t="yt">▶️ YouTube</button><button class="t" data-t="sub">📝 Subtitrări</button></div>
+<h1>🎤 Vocal Remover</h1><div class="sub">Separare voce · Tonalitate & tempo · YouTube · <a href="subtitrari/" style="color:var(--ok);text-decoration:none">📝 Subtitrări →</a></div>
+<div class="tabs"><button class="t on" data-t="sep">🎤 Separare voce</button><button class="t" data-t="yt">▶️ YouTube</button></div>
 
 <section id="sep">
 <div class="drop" id="drop">📂 Trage fișiere aici sau apasă pentru a alege<br>
@@ -734,20 +861,6 @@ a.d{color:var(--ok);font-size:13px;text-decoration:none}
 <div id="sel" class="sub"></div>
 </section>
 
-<section id="sub" hidden>
-<div class="drop" id="sdrop">📝 Trage aici filme, clipuri sau audio pentru subtitrare<br>
-<small style="color:var(--mu)">MP4, MKV, AVI, MP3, WAV… · rezultat SRT / VTT / TXT</small>
-<input type="file" id="sf" multiple accept="audio/*,video/*,.mkv,.avi,.ts" hidden></div>
-<div id="cvpick" hidden style="margin-top:12px">
- <input id="cvq" placeholder="🔎 Sau caută un film / episod direct din CineVerse (fără upload)…">
- <div id="cvres"></div>
-</div>
-<div class="row"><select id="wm">%WMODELS%</select><select id="wl">%WLANGS%</select>
-<select id="wt"><option value="transcribe">Transcriere (aceeași limbă)</option><option value="translate">Traducere în engleză</option></select>
-<button class="p" id="sgo">Generează</button></div>
-<div id="ssel" class="sub"></div>
-</section>
-
 <section id="yt" hidden>
 <textarea id="urls" placeholder="Lipește link-uri YouTube (unul pe linie)&#10;https://www.youtube.com/watch?v=..."></textarea>
 <div class="row"><select id="yfmt">%YTFMTS%</select>
@@ -759,9 +872,9 @@ a.d{color:var(--ok);font-size:13px;text-decoration:none}
 <script>
 const $=s=>document.querySelector(s);let files=[];
 function tab(t){document.querySelectorAll('.t').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
- $('#sep').hidden=t!=='sep';$('#yt').hidden=t!=='yt';$('#sub').hidden=t!=='sub';try{localStorage.setItem('tab',t)}catch(e){}}
+ $('#sep').hidden=t!=='sep';$('#yt').hidden=t!=='yt';try{localStorage.setItem('tab',t)}catch(e){}}
 document.querySelectorAll('.t').forEach(b=>b.onclick=()=>tab(b.dataset.t));
-let t0='sep';try{t0=localStorage.getItem('tab')||'sep'}catch(e){};tab(t0);
+let t0='sep';try{t0=localStorage.getItem('tab')||'sep'}catch(e){};if(t0!=='yt')t0='sep';tab(t0);
 
 const drop=$('#drop'),inp=$('#f');
 drop.onclick=()=>inp.click();
@@ -778,47 +891,14 @@ $('#go').onclick=()=>{if(!files.length)return alert('Alege fișiere!');
  x.upload.onprogress=e=>$('#sel').textContent='Încărcare: '+Math.round(e.loaded/e.total*100)+'%';
  x.onload=()=>{files=[];inp.value='';$('#sel').textContent='';load()};x.send(fd)};
 
-// ---------- subtitrări ----------
-let sfiles=[];const sdrop=$('#sdrop'),sinp=$('#sf');
-sdrop.onclick=()=>sinp.click();
-const sShow=()=>{$('#ssel').textContent=sfiles.length?sfiles.length+' fișier(e): '+sfiles.map(f=>f.name).join(', '):''};
-sinp.onchange=()=>{sfiles=[...sinp.files];sShow()};
-['dragover','dragenter'].forEach(e=>sdrop.addEventListener(e,ev=>{ev.preventDefault();sdrop.classList.add('on')}));
-['dragleave','drop'].forEach(e=>sdrop.addEventListener(e,ev=>{ev.preventDefault();sdrop.classList.remove('on')}));
-sdrop.addEventListener('drop',ev=>{sfiles=[...ev.dataTransfer.files];sShow()});
-try{const v=JSON.parse(localStorage.getItem('wopt')||'{}');for(const k of ['wm','wl','wt'])if(v[k])$('#'+k).value=v[k]}catch(e){}
-// ---- CineVerse ----
-let CV={enabled:false,dirs:[]};const cvSel=new Set();
-fetch('cv').then(r=>r.json()).then(d=>{CV=d;$('#cvpick').hidden=!d.enabled;last='';load()}).catch(()=>{});
-let cvT;$('#cvq').oninput=()=>{clearTimeout(cvT);cvT=setTimeout(cvSearch,300)};
-async function cvSearch(){const q=$('#cvq').value.trim();if(q.length<2){$('#cvres').innerHTML='';return}
- const d=await (await fetch('cv/videos?q='+encodeURIComponent(q))).json();
- $('#cvres').innerHTML=d.length?d.map(v=>`<label class="cvi"><input type="checkbox" value="${esc(v.path)}" ${cvSel.has(v.path)?'checked':''}>🎬 ${esc(v.rel)}</label>`).join(''):'<div class="st" style="padding:8px">Nimic găsit</div>'}
-$('#cvres').addEventListener('change',e=>{if(e.target.checked)cvSel.add(e.target.value);else cvSel.delete(e.target.value);
- $('#ssel').textContent=cvSel.size?cvSel.size+' film(e) din CineVerse selectate':''});
-async function cvVideoPick(id){const q=prompt('Caută filmul / episodul din CineVerse:');if(!q)return;
- const d=await (await fetch('cv/videos?q='+encodeURIComponent(q))).json();
- if(!d.length)return alert('Nimic găsit');
- const s=document.getElementById('cvv_'+id);s.innerHTML=d.map(v=>`<option value="${esc(v.path)}">${esc(v.rel)}</option>`).join('');s.hidden=false;
- document.getElementById('cvb_'+id).hidden=false}
-async function cvSend(id,kind){const fd=new FormData();
- if(kind==='sub'){const s=document.getElementById('cvv_'+id);if(!s.value)return;fd.append('video',s.value)}
- else{fd.append('dir',document.getElementById('cvd_'+id).value);fd.append('sub',document.getElementById('cvs_'+id).value)}
+// ---- CineVerse (clipuri YouTube) ----
+let CV={enabled:false,dirs:[]};
+fetch('cv').then(r=>r.json()).then(d=>{CV=d;last='';load()}).catch(()=>{});
+async function cvSend(id){const fd=new FormData();
+ fd.append('dir',document.getElementById('cvd_'+id).value);fd.append('sub',document.getElementById('cvs_'+id).value);
  const r=await fetch('cv/send/'+id,{method:'POST',body:fd});const d=await r.json().catch(()=>({}));
  if(!r.ok||!d.ok)return alert(d.error||'Eroare');last='';load()}
 const cvDone=j=>j.cv?`<div class="ok">✅ În CineVerse: ${esc(j.cv)}</div>`:'';
-
-$('#sgo').onclick=async()=>{
- if(cvSel.size&&!sfiles.length){const fd=new FormData();[...cvSel].forEach(p=>fd.append('paths',p));
-  fd.append('wmodel',$('#wm').value);fd.append('lang',$('#wl').value);fd.append('task',$('#wt').value);
-  await fetch('subcv',{method:'POST',body:fd});cvSel.clear();$('#cvres').innerHTML='';$('#cvq').value='';$('#ssel').textContent='';last='';return load()}
- if(!sfiles.length)return alert('Alege fișiere sau un film din CineVerse!');
- try{localStorage.setItem('wopt',JSON.stringify({wm:$('#wm').value,wl:$('#wl').value,wt:$('#wt').value}))}catch(e){}
- const fd=new FormData();sfiles.forEach(f=>fd.append('files',f));
- fd.append('wmodel',$('#wm').value);fd.append('lang',$('#wl').value);fd.append('task',$('#wt').value);
- const x=new XMLHttpRequest();x.open('POST','subupload');
- x.upload.onprogress=e=>$('#ssel').textContent='Încărcare: '+Math.round(e.loaded/e.total*100)+'%';
- x.onload=()=>{sfiles=[];sinp.value='';$('#ssel').textContent='';last='';load()};x.send(fd)};
 
 const syncSep=()=>{const mp3=$('#yfmt').value==='mp3';$('#ysep').disabled=!mp3;if(!mp3)$('#ysep').checked=false;
  $('#ysep').parentElement.style.opacity=mp3?1:.4};
@@ -878,24 +958,7 @@ async function applyFx(id){const c=C(byId[id]);if(!c.semi&&c.tempo===100)return 
  const r=await fetch('shift/'+id,{method:'POST',body:fd});if(!r.ok)return alert('Eroare server');last='';load()}
 async function delShift(id,sid){await fetch('delshift/'+id+'/'+sid,{method:'POST'});last='';load()}
 
-const LN={ro:'Română',en:'English',it:'Italiano',es:'Español',fr:'Français',de:'Deutsch',hu:'Magyar',ru:'Русский',tr:'Türkçe'};
-function subCard(j){
- const stg=j.stage==='model'?'⬇️ Pregătesc modelul Whisper (prima dată se descarcă)…':j.stage==='run'?'⚙️ Transcriere '+j.progress+'%':'⏳ Pornire…';
- const st={queued:'⏳ În așteptare'+(j.queue_pos?' (#'+j.queue_pos+')':''),processing:stg,done:'✅ Gata',error:'❌ Eroare'}[j.status];
- const meta=(j.cvsrc?'CineVerse · ':'')+j.wmodel+' · '+(j.task==='translate'?'→ English':(j.lang==='auto'?'auto':LN[j.lang]||j.lang));
- let body='';
- if(j.status==='processing'||j.status==='queued')body=`<div class="bar"><i style="width:${j.progress}%"></i></div>`;
- if(j.status==='done')body=`<div class="ana"><span>🌐 Limbă: <b>${esc(LN[j.dlang]||j.dlang||'?')}</b></span><span>💬 ${j.segs||0} replici</span></div>
-  <div class="res one"><div style="display:flex;gap:14px;flex-wrap:wrap">${['srt','vtt','txt'].map(k=>`<a class="d" href="dl/${j.id}/${k}">⬇ ${k.toUpperCase()}</a>`).join('')}
-  <a class="d" style="color:var(--mu)" href="dl/${j.id}/srt?play=1" target="_blank">👁 Vezi SRT</a></div></div>`
-  +(j.cv?cvDone(j):CV.enabled?`<div class="cvbox"><button onclick="cvVideoPick('${j.id}')">📺 Trimite în CineVerse</button>
-   <select id="cvv_${j.id}" hidden></select><button class="p" id="cvb_${j.id}" hidden onclick="cvSend('${j.id}','sub')">Pune subtitrarea lângă film</button></div>`:'')
-  +(j.cverr?`<div class="err">CineVerse: ${esc(j.cverr)}</div>`:'');
- if(j.status==='error')body=`<div class="err">${esc(j.error)}</div>`;
- return `<div class="job"><div class="top"><div class="nm">📝 ${esc(j.name)}</div>
-  <div><span class="st">${st} · ${esc(meta)}</span><button class="x" title="Șterge" onclick="del('${j.id}')">✕</button></div></div>${body}</div>`}
-
-function card(j){if(j.type==='sub')return subCard(j);const yt=j.type==='yt';
+function card(j){const yt=j.type==='yt';
  const st={queued:'⏳ În așteptare'+(j.queue_pos?' (#'+j.queue_pos+')':''),processing:'⚙️ '+(yt?'Descărcare ':'Procesare ')+j.progress+'%',done:'✅ Gata',error:'❌ Eroare'}[j.status];
  const meta=yt?(j.fmt==='mp3'?'YouTube · MP3':'YouTube · '+(j.fmt==='best'?'max':j.fmt+'p')):(j.mode==='ana'?'tonalitate/tempo':j.mode==='sep4'?'4 piste · '+j.model:j.model)+' · '+j.fmt;
  let body='';
@@ -904,7 +967,7 @@ function card(j){if(j.type==='sub')return subCard(j);const yt=j.type==='yt';
   if(yt){const s=`dl/${j.id}/file`;
    body=`<div class="res one"><div>${j.fmt==='mp3'?`<audio controls preload="none" src="${s}?play=1"></audio>`:`<video controls preload="none" src="${s}?play=1"></video>`}<a class="d" href="${s}">⬇ Descarcă</a></div></div>`
    +(j.fmt!=='mp3'?(j.cv?cvDone(j):CV.enabled?`<div class="cvbox"><select id="cvd_${j.id}">${CV.dirs.map(d=>`<option value="${d.i}">📁 ${esc(d.name)}</option>`).join('')}</select>
-   <input id="cvs_${j.id}" placeholder="Subfolder (opțional, ex. YouTube)"><button class="p" onclick="cvSend('${j.id}','yt')">📺 Trimite în CineVerse</button></div>`:''):'')}
+   <input id="cvs_${j.id}" placeholder="Subfolder (opțional, ex. YouTube)"><button class="p" onclick="cvSend('${j.id}')">📺 Trimite în CineVerse</button></div>`:''):'')}
   else{const tk=TRK(j);
    body=`<div class="res${tk.length===1?' one':''}">${tk.map(k=>`<div><b>${TL[k]}</b>
    <audio controls preload="none" src="dl/${j.id}/${k}?play=1"></audio><a class="d" href="dl/${j.id}/${k}">⬇ Descarcă</a></div>`).join('')}</div>`+fx(j)}}
@@ -922,6 +985,104 @@ async function del(id){if(confirm('Ștergi?')){await fetch('delete/'+id,{method:
 load();
 </script></body></html>"""
 
+CSS = HTML.split("<style>", 1)[1].split("</style>", 1)[0]
+
+LOGIN = r"""<!doctype html><html lang="ro"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Subtitrări · Autentificare</title>
+<style>%CSS%
+.lg{max-width:360px;margin:12vh auto;padding:28px 22px;background:var(--card);border:1px solid var(--bd);border-radius:16px}
+.lg h1{font-size:24px}.lg input[type=text],.lg input[type=password]{width:100%;margin-top:12px;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:10px;padding:12px;font-size:15px}
+.lg input:focus{outline:none;border-color:var(--ac)}.lg button{width:100%;margin-top:16px;padding:12px;font-size:15px}
+.lg label{display:flex;gap:8px;align-items:center;margin-top:12px;color:var(--mu);font-size:14px}.lg code{color:var(--tx)}
+</style></head><body><form class="lg" method="post" action="login">
+<h1>📝 Subtitrări</h1><div class="sub">Autentifică-te pentru a continua</div>%MSG%
+<input type="text" name="u" placeholder="Utilizator" autocomplete="username" autofocus required>
+<input type="password" name="p" placeholder="Parolă" autocomplete="current-password" required>
+<label><input type="checkbox" name="r" value="1" checked> Ține-mă minte 30 de zile</label>
+<button class="p" type="submit">Intră</button></form></body></html>"""
+
+SUBHTML = r"""<!doctype html><html lang="ro"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Subtitrări AI</title>
+<style>%CSS%
+.hd{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+.hd a{color:var(--mu);font-size:13px;text-decoration:none;white-space:nowrap}
+</style></head><body><div class="w">
+<div class="hd"><div><h1>📝 Subtitrări AI</h1><div class="sub">Transcriere și traducere automată cu Whisper · SRT / VTT / TXT</div></div>
+<a href="logout">👤 %USER% · Ieșire</a></div>
+<div class="drop" id="sdrop">📝 Trage aici filme, clipuri sau audio pentru subtitrare<br>
+<small style="color:var(--mu)">MP4, MKV, AVI, MP3, WAV… · rezultat SRT / VTT / TXT</small>
+<input type="file" id="sf" multiple accept="audio/*,video/*,.mkv,.avi,.ts" hidden></div>
+<div id="cvpick" hidden style="margin-top:12px">
+ <input id="cvq" placeholder="🔎 Sau caută un film / episod direct din CineVerse (fără upload)…">
+ <div id="cvres"></div>
+</div>
+<div class="row"><select id="wm">%WMODELS%</select><select id="wl">%WLANGS%</select>
+<select id="wt"><option value="transcribe">Transcriere (aceeași limbă)</option><option value="translate">Traducere în engleză</option></select>
+<button class="p" id="sgo">Generează</button></div>
+<div id="ssel" class="sub"></div>
+<div id="list"></div></div>
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const api=(u,o)=>fetch('api/'+u,o).then(r=>{if(r.status===401){location.href='login';throw 0}return r});
+let sfiles=[];const sdrop=$('#sdrop'),sinp=$('#sf');
+sdrop.onclick=()=>sinp.click();
+const sShow=()=>{$('#ssel').textContent=sfiles.length?sfiles.length+' fișier(e): '+sfiles.map(f=>f.name).join(', '):''};
+sinp.onchange=()=>{sfiles=[...sinp.files];sShow()};
+['dragover','dragenter'].forEach(e=>sdrop.addEventListener(e,ev=>{ev.preventDefault();sdrop.classList.add('on')}));
+['dragleave','drop'].forEach(e=>sdrop.addEventListener(e,ev=>{ev.preventDefault();sdrop.classList.remove('on')}));
+sdrop.addEventListener('drop',ev=>{sfiles=[...ev.dataTransfer.files];sShow()});
+try{const v=JSON.parse(localStorage.getItem('wopt')||'{}');for(const k of ['wm','wl','wt'])if(v[k])$('#'+k).value=v[k]}catch(e){}
+let CV={enabled:false,dirs:[]};const cvSel=new Set();
+api('cv').then(r=>r.json()).then(d=>{CV=d;$('#cvpick').hidden=!d.enabled;last='';load()}).catch(()=>{});
+let cvT;$('#cvq').oninput=()=>{clearTimeout(cvT);cvT=setTimeout(cvSearch,300)};
+async function cvSearch(){const q=$('#cvq').value.trim();if(q.length<2){$('#cvres').innerHTML='';return}
+ const d=await (await api('videos?q='+encodeURIComponent(q))).json();
+ $('#cvres').innerHTML=d.length?d.map(v=>`<label class="cvi"><input type="checkbox" value="${esc(v.path)}" ${cvSel.has(v.path)?'checked':''}>🎬 ${esc(v.rel)}</label>`).join(''):'<div class="st" style="padding:8px">Nimic găsit</div>'}
+$('#cvres').addEventListener('change',e=>{if(e.target.checked)cvSel.add(e.target.value);else cvSel.delete(e.target.value);
+ $('#ssel').textContent=cvSel.size?cvSel.size+' film(e) din CineVerse selectate':''});
+async function cvVideoPick(id){const q=prompt('Caută filmul / episodul din CineVerse:');if(!q)return;
+ const d=await (await api('videos?q='+encodeURIComponent(q))).json();
+ if(!d.length)return alert('Nimic găsit');
+ const s=document.getElementById('cvv_'+id);s.innerHTML=d.map(v=>`<option value="${esc(v.path)}">${esc(v.rel)}</option>`).join('');s.hidden=false;
+ document.getElementById('cvb_'+id).hidden=false}
+async function cvSend(id){const s=document.getElementById('cvv_'+id);if(!s.value)return;
+ const fd=new FormData();fd.append('video',s.value);
+ const r=await api('send/'+id,{method:'POST',body:fd});const d=await r.json().catch(()=>({}));
+ if(!r.ok||!d.ok)return alert(d.error||'Eroare');last='';load()}
+const opts=fd=>{fd.append('wmodel',$('#wm').value);fd.append('lang',$('#wl').value);fd.append('task',$('#wt').value);
+ try{localStorage.setItem('wopt',JSON.stringify({wm:$('#wm').value,wl:$('#wl').value,wt:$('#wt').value}))}catch(e){}};
+$('#sgo').onclick=async()=>{
+ if(cvSel.size&&!sfiles.length){const fd=new FormData();[...cvSel].forEach(p=>fd.append('paths',p));opts(fd);
+  await api('fromcv',{method:'POST',body:fd});cvSel.clear();$('#cvres').innerHTML='';$('#cvq').value='';$('#ssel').textContent='';last='';return load()}
+ if(!sfiles.length)return alert('Alege fișiere sau un film din CineVerse!');
+ const fd=new FormData();sfiles.forEach(f=>fd.append('files',f));opts(fd);
+ const x=new XMLHttpRequest();x.open('POST','api/upload');
+ x.upload.onprogress=e=>$('#ssel').textContent='Încărcare: '+Math.round(e.loaded/e.total*100)+'%';
+ x.onload=()=>{if(x.status===401)return location.href='login';sfiles=[];sinp.value='';$('#ssel').textContent='';last='';load()};x.send(fd)};
+const LN={ro:'Română',en:'English',it:'Italiano',es:'Español',fr:'Français',de:'Deutsch',hu:'Magyar',ru:'Русский',tr:'Türkçe'};
+function card(j){
+ const stg=j.stage==='model'?'⬇️ Pregătesc modelul Whisper (prima dată se descarcă)…':j.stage==='run'?'⚙️ Transcriere '+j.progress+'%':'⏳ Pornire…';
+ const st={queued:'⏳ În așteptare'+(j.queue_pos?' (#'+j.queue_pos+')':''),processing:stg,done:'✅ Gata',error:'❌ Eroare'}[j.status];
+ const meta=(j.cvsrc?'CineVerse · ':'')+j.wmodel+' · '+(j.task==='translate'?'→ English':(j.lang==='auto'?'auto':LN[j.lang]||j.lang));
+ let body='';
+ if(j.status==='processing'||j.status==='queued')body=`<div class="bar"><i style="width:${j.progress}%"></i></div>`;
+ if(j.status==='done')body=`<div class="ana"><span>🌐 Limbă: <b>${esc(LN[j.dlang]||j.dlang||'?')}</b></span><span>💬 ${j.segs||0} replici</span></div>
+  <div class="res one"><div style="display:flex;gap:14px;flex-wrap:wrap">${['srt','vtt','txt'].map(k=>`<a class="d" href="api/dl/${j.id}/${k}">⬇ ${k.toUpperCase()}</a>`).join('')}
+  <a class="d" style="color:var(--mu)" href="api/dl/${j.id}/srt?play=1" target="_blank">👁 Vezi SRT</a></div></div>`
+  +(j.cv?`<div class="ok">✅ În CineVerse: ${esc(j.cv)}</div>`:CV.enabled?`<div class="cvbox"><button onclick="cvVideoPick('${j.id}')">📺 Trimite în CineVerse</button>
+   <select id="cvv_${j.id}" hidden></select><button class="p" id="cvb_${j.id}" hidden onclick="cvSend('${j.id}')">Pune subtitrarea lângă film</button></div>`:'')
+  +(j.cverr?`<div class="err">CineVerse: ${esc(j.cverr)}</div>`:'');
+ if(j.status==='error')body=`<div class="err">${esc(j.error)}</div>`;
+ return `<div class="job"><div class="top"><div class="nm">📝 ${esc(j.name)}</div>
+  <div><span class="st">${st} · ${esc(meta)}</span><button class="x" title="Șterge" onclick="del('${j.id}')">✕</button></div></div>${body}</div>`}
+let last='';const L=$('#list');
+async function load(){try{const t=await (await api('jobs')).text();if(t===last)return;last=t;L.innerHTML=JSON.parse(t).map(card).join('')}catch(e){}}
+setInterval(()=>{const a=document.activeElement;if(!(a&&a.tagName==='SELECT'&&L.contains(a)))load()},2500);
+async function del(id){if(confirm('Ștergi?')){await api('delete/'+id,{method:'POST'});last='';load()}}
+load();
+</script></body></html>"""
+
 load()
 threading.Thread(target=sep_worker, daemon=True).start()
 threading.Thread(target=yt_worker, daemon=True).start()
@@ -932,6 +1093,28 @@ if __name__ == "__main__":
     from waitress import serve
     serve(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8095)), threads=8)
 PYEOF
+
+echo "==> Login Subtitrări..."
+cat > /usr/local/bin/subtitrari-parola <<'SPEOF'
+#!/bin/bash
+# Schimbă utilizatorul / parola paginii Subtitrări
+[ "$EUID" -ne 0 ] && { echo "Rulează cu sudo!"; exit 1; }
+B=/opt/vocal-remover
+read -rp "Utilizator [admin]: " U; U="${U:-admin}"
+while :; do
+  read -rsp "Parolă nouă: " P; echo; read -rsp "Confirmă: " P2; echo
+  [ -n "$P" ] && [ "$P" = "$P2" ] && break; echo "Parolele nu coincid sau sunt goale."
+done
+U="$U" P="$P" "$B/venv/bin/python" -c "import json,os;from werkzeug.security import generate_password_hash as g;json.dump({'user':os.environ['U'],'hash':g(os.environ['P'])},open('$B/subauth.json','w'))"
+chown "$(stat -c %U "$B/app.py")": "$B/subauth.json"; chmod 600 "$B/subauth.json"
+echo "✅ Parola a fost schimbată (sesiunile vechi sunt delogate)."
+SPEOF
+chmod 755 /usr/local/bin/subtitrari-parola
+if [ -n "$SUB_PASS" ]; then
+  U="$SUB_USER" P="$SUB_PASS" "$BASE/venv/bin/python" -c "import json,os;from werkzeug.security import generate_password_hash as g;json.dump({'user':os.environ['U'],'hash':g(os.environ['P'])},open('$BASE/subauth.json','w'))"
+  chmod 600 "$BASE/subauth.json"
+  echo "   utilizator Subtitrări: $SUB_USER"
+fi
 
 chown -R "$APPUSER":"$APPUSER" "$BASE"
 
@@ -1010,20 +1193,9 @@ if ufw status 2>/dev/null | grep -q active; then ufw allow $PORT/tcp >/dev/null;
 
 # ---------- nginx + parolă (opțional) ----------
 EXTURL=""
-if [ "$SETUP_NGINX" = "yes" ]; then
-  echo "==> nginx pentru $DOMAIN/vocal/ ..."
-  command -v nginx >/dev/null 2>&1 || apt-get install -y -qq nginx >/dev/null
-  CONF=$(nginx -V 2>&1 | grep -o -- '--conf-path=[^ ]*' | cut -d= -f2)
-  NDIR=$(dirname "${CONF:-/etc/nginx/nginx.conf}")
-  SNIP="$NDIR/vocal-remover.conf"
-  HTP="$NDIR/.htpasswd-vocal"
-  BK="/root/nginx-backup-vocal-$(date +%Y%m%d-%H%M%S)"
-
-  printf '%s:%s\n' "$VR_USER" "$(openssl passwd -apr1 "$VR_PASS")" > "$HTP"
-  chmod 644 "$HTP"
-
-  cat > "$SNIP" <<'EOF'
-# Vocal Remover – inclus în server block-ul domeniului
+write_snip() {
+  cat > "$SNIP" <<'NGEOF'
+# Vocal Remover + Subtitrări – inclus în server block-ul domeniului
 location = /vocal { return 301 /vocal/; }
 location /vocal/ {
     auth_basic "Vocal Remover";
@@ -1040,8 +1212,52 @@ location /vocal/ {
     proxy_read_timeout 3600s;
     proxy_send_timeout 3600s;
 }
-EOF
-  sed -i "s|__HTP__|$HTP|; s|__PORT__|$PORT|" "$SNIP"
+# Subtitrări – login propriu (fără auth_basic)
+location = /subtitrari { return 301 /subtitrari/; }
+location /subtitrari/ {
+    proxy_pass http://127.0.0.1:__PORT__/subtitrari/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    client_max_body_size 8G;
+    proxy_request_buffering off;
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+}
+NGEOF
+  sed -i "s|__HTP__|$HTP|; s|__PORT__|$PORT|g" "$SNIP"
+}
+if command -v nginx >/dev/null 2>&1; then
+  CONF=$(nginx -V 2>&1 | grep -o -- '--conf-path=[^ ]*' | cut -d= -f2)
+  NDIR=$(dirname "${CONF:-/etc/nginx/nginx.conf}")
+  SNIP="$NDIR/vocal-remover.conf"; HTP="$NDIR/.htpasswd-vocal"
+  # nginx configurat de o instalare anterioară -> doar actualizez rutele (adaug /subtitrari/)
+  if [ "$SETUP_NGINX" != "yes" ] && [ -f "$SNIP" ]; then
+    echo "==> nginx: actualizez rutele (/vocal/ + /subtitrari/)..."
+    cp -a "$SNIP" "/root/vocal-remover.conf.bak"
+    write_snip
+    if nginx -t >/dev/null 2>&1; then
+      systemctl reload nginx 2>/dev/null || nginx -s reload; EXTURL="$DOMAIN"
+    else
+      cp -a "/root/vocal-remover.conf.bak" "$SNIP"; echo "   ⚠ nginx -t a eșuat, am păstrat configurația veche"
+    fi
+  fi
+fi
+if [ "$SETUP_NGINX" = "yes" ]; then
+  echo "==> nginx pentru $DOMAIN/vocal/ și /subtitrari/ ..."
+  command -v nginx >/dev/null 2>&1 || apt-get install -y -qq nginx >/dev/null
+  CONF=$(nginx -V 2>&1 | grep -o -- '--conf-path=[^ ]*' | cut -d= -f2)
+  NDIR=$(dirname "${CONF:-/etc/nginx/nginx.conf}")
+  SNIP="$NDIR/vocal-remover.conf"
+  HTP="$NDIR/.htpasswd-vocal"
+  BK="/root/nginx-backup-vocal-$(date +%Y%m%d-%H%M%S)"
+
+  printf '%s:%s\n' "$VR_USER" "$(openssl passwd -apr1 "$VR_PASS")" > "$HTP"
+  chmod 644 "$HTP"
+  write_snip
 
   DRE="${DOMAIN//./\\.}"
   FILES=$(grep -rlE "server_name[^;]*${DRE}" "$NDIR" 2>/dev/null | grep -v -e "$SNIP" -e '\.bak' || true)
@@ -1072,7 +1288,7 @@ EOF
 
   if nginx -t >/dev/null 2>&1; then
     systemctl reload nginx 2>/dev/null || nginx -s reload
-    EXTURL="$DOMAIN/vocal/"
+    EXTURL="$DOMAIN"
   else
     echo "   ⚠ nginx -t a eșuat, restaurez configurația:"
     nginx -t 2>&1 | tail -3
@@ -1085,9 +1301,11 @@ fi
 IP=$(hostname -I | awk '{print $1}')
 echo ""
 echo "============================================"
-echo " ✅ Vocal Remover + YouTube instalat!"
-echo " 🌐 Local:  http://$IP:$PORT"
-[ -n "$EXTURL" ] && echo " 🌍 Extern: https://$EXTURL  (sau http://, după cum e domeniul)  user: $VR_USER"
+echo " ✅ Vocal Remover + Subtitrări instalat!"
+echo " 🎤 Vocal Remover:  http://$IP:$PORT"
+echo " 📝 Subtitrări:     http://$IP:$PORT/subtitrari/"
+[ -n "$EXTURL" ] && echo " 🌍 Extern:  https://$EXTURL/vocal/   și   https://$EXTURL/subtitrari/"
+[ -n "$SUB_GEN" ] && echo " 🔑 Login Subtitrări:  $SUB_USER / $SUB_PASS   (schimbă cu: sudo subtitrari-parola)"
+echo " Parolă Subtitrări: sudo subtitrari-parola"
 echo " Log:     journalctl -u vocal-remover -f"
-echo " Restart: sudo systemctl restart vocal-remover"
 echo "============================================"
